@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cks-optimizer"
+version = "0.1.0"
+description = "Model optimization toolkit for CNN/vision models and LLM compression workflows."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Li Wei" }]
+license = { text = "Apache-2.0" }
+keywords = ["modelopt", "llmcompressor", "quantization", "onnx", "cnn", "llm"]
+dependencies = [
+  "torch",
+  "onnx",
+  "onnxruntime",
+  "numpy",
+]
+
+[project.optional-dependencies]
+modelopt = ["modelopt"]
+llm = ["llmcompressor", "transformers"]
+dev = [
+  "ruff>=0.5",
+  "mypy>=1.10",
+]
+
+[project.scripts]
+cks-opt = "cks_optimizer.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cks_optimizer*"]
