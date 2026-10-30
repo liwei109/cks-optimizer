@@ -1,36 +1,117 @@
+"""End-to-end CNN optimization pipeline (six stages)."""
+
 from __future__ import annotations
 
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from cks_optimizer.cnn.api import optimize_cnn_model
-from cks_optimizer.cnn.config import CNNConfig
-from cks_optimizer.cnn.data.registry import get_dataset_adapter
-from cks_optimizer.cnn.tasks import get_task_name
+import torch
+
+from cks_optimizer.cnn.config import OptimizeConfig, build_optimize_config
+from cks_optimizer.cnn.datasets.processing import ProcessedData, data_process
+from cks_optimizer.cnn.evaluate import EvaluationResult, evaluate
+from cks_optimizer.cnn.export import export_onnx
+from cks_optimizer.cnn.models import load_cnn_model
+from cks_optimizer.cnn.optimizer import optimize_cnn_model
+
+__all__ = ["OptimizationResult", "run_cnn_pipeline"]
+
+
+@dataclass
+class OptimizationResult:
+    """Models, data, and artifacts produced by a CNN optimization run."""
+
+    config: OptimizeConfig
+    data: ProcessedData
+    model: torch.nn.Module
+    sample_input: torch.Tensor
+    optimized_model: torch.nn.Module
+    onnx_path: Path
+    algorithms: tuple[str, ...]
+    evaluation: EvaluationResult | None = None
+
+    def summary(self) -> str:
+        lines = [
+            f"model={self.config.model_name}",
+            f"task={self.config.task}",
+            f"algorithms={list(self.algorithms)}",
+            f"onnx_path={self.onnx_path}",
+        ]
+        if self.config.quant is not None:
+            lines.insert(2, f"quant_mode={self.config.quant.mode}")
+        if self.evaluation is not None:
+            lines.append(self.evaluation.summary())
+        return "\n".join(lines)
 
 
 def run_cnn_pipeline(
-    model: Any,
-    model_name: str,
-    dataset_root: str,
-    task: str,
-    dataset_kind: str = "imagefolder",
-    sample_input: Any | None = None,
-    output_path: str = "tmp/quantized_model.onnx",
-    **kwargs: Any,
-):
-    """High-level pipeline for CNN optimization tasks."""
-    task_name = get_task_name(task)
-    adapter = get_dataset_adapter(dataset_kind, dataset_root, **kwargs)
+    config: Any = None,
+    *,
+    model: Any = None,
+    evaluate_model: bool = True,
+    providers: list[str] | None = None,
+    **overrides: Any,
+) -> OptimizationResult:
+    """Run the CNN optimization pipeline.
 
-    config = CNNConfig(
-        model_name=model_name,
-        task=task_name,
-        dataset_kind=dataset_kind,
-        dataset_root=dataset_root,
-        output_path=output_path,
+    ``model`` accepts a model instance, model name, or model path and
+    overrides ``config.model_name`` when provided. Calibration and export
+    inputs come from the dataset where possible.
+    Algorithms are selected by the configured ``quant`` and ``sparsity``
+    sections.
+    """
+    # Normalize the config and apply explicit overrides.
+    cfg = build_optimize_config(config, **overrides)
+    if not cfg.effective_algorithms:
+        raise ValueError(
+            "No optimization algorithm configured. Add a 'quant' and/or "
+            "'sparsity' section to the config."
+        )
+
+    # Load onnx or pytorch model.
+    model = load_cnn_model(
+        model if model is not None else cfg.model_name,
+        pretrained=cfg.pretrained,
+        device=cfg.device or None,
     )
 
-    if sample_input is None:
-        raise ValueError("sample_input is required for ModelOpt Torch quantization")
+    # Prepare calibration data and sample input.
+    data, sample_input = data_process(
+        cfg,
+        model=model,
+        include_evaluation=evaluate_model and cfg.evaluation_supported,
+    )
 
-    return optimize_cnn_model(model, sample_input, config=config, output_path=output_path)
+    # Sparsify and quantize the model.
+    optimized_model = optimize_cnn_model(
+        model,
+        sample_input,
+        config=cfg,
+        calib_data=data.calib_data,
+    )
+
+    # Export the optimized model.
+    optimized_onnx_path = export_onnx(optimized_model, sample_input, config=cfg)
+
+    # Measure metrics and analyze the optimized error.
+    evaluation = evaluate(
+        optimized_onnx_path,
+        data.evaluation_dataset,
+        task=cfg.task,
+        config=cfg,
+        enabled=evaluate_model,
+        input_name=cfg.export.input_names[0],
+        providers=providers,
+    )
+
+    return OptimizationResult(
+        config=cfg,
+        data=data,
+        model=model,
+        sample_input=sample_input,
+        optimized_model=optimized_model,
+        onnx_path=optimized_onnx_path,
+        evaluation=evaluation,
+        algorithms=tuple(cfg.effective_algorithms),
+    )

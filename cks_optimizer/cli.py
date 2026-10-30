@@ -1,20 +1,44 @@
+"""Command-line interface for the CKS model optimizer."""
+
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
+import json
+import logging
+import sys
+from typing import Any
 
-from cks_optimizer.cnn import CNNConfig, optimize_cnn_model
+from cks_optimizer.cnn import run_cnn_pipeline
 from cks_optimizer.cnn.config import (
+    QUANT_MODES,
     build_default_output_path,
-    infer_dataset_kind_from_root,
-    infer_task_from_model_and_dataset,
+    build_optimize_config,
 )
-from cks_optimizer.cnn.model_loader import resolve_cnn_model_and_sample_input
-from cks_optimizer.llm.llmcompressor_adapter import LLMCompressorAdapter
+from cks_optimizer.lm.optimizer import LMOptimizer
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["main"]
+
+
+def _write_stdout(text: str) -> None:
+    """Write one user-facing CLI result without mixing it with log messages."""
+    sys.stdout.write(f"{text}\n")
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="CKS model optimizer")
+    parser = argparse.ArgumentParser(
+        prog="cks-optimizer",
+        description=(
+            "CKS model optimizer for CNN and LM."
+        ),
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable debug logging.",
+    )
     subparsers = parser.add_subparsers(dest="group")
 
     cnn_parser = subparsers.add_parser(
@@ -22,164 +46,264 @@ def _build_parser() -> argparse.ArgumentParser:
         help="CNN / CV optimization with ModelOpt",
     )
     cnn_parser.add_argument(
+        "--config",
+        default="",
+        help="Path to a YAML/JSON optimization config file.",
+    )
+    cnn_parser.add_argument(
         "--model",
-        required=True,
-        help="Model name or path",
+        default="",
+        help="Model name or path (overrides the config).",
     )
     cnn_parser.add_argument(
         "--dataset",
-        required=True,
-        help="Dataset root or annotation file",
+        default="",
+        help="Dataset root directory (overrides the config).",
     )
-    cnn_parser.add_argument("--quant-mode", default="int8")
+    cnn_parser.add_argument(
+        "--quant-mode",
+        default="",
+        choices=sorted(QUANT_MODES),
+        help="Quantization mode (int8, fp8, nvfp4, mxfp8, ...).",
+    )
+    cnn_parser.add_argument(
+        "--sparsity",
+        type=float,
+        default=None,
+        help=(
+            "Target sparsity ratio for the 'sparsify' algorithm. When "
+            "provided, a sparsity config section is added."
+        ),
+    )
+    cnn_parser.add_argument(
+        "--sparsity-mode",
+        default=None,
+        help=(
+            "Sparsity mode for the 'sparsify' algorithm. When provided, "
+            "a sparsity config section is added."
+        ),
+    )
     cnn_parser.add_argument(
         "--output",
         default="",
-        help="Output path; defaults to <model>.<quant_mode>.onnx under tmp/",
+        help="Output path; defaults to tmp/<model>.<quant_mode-or-optimized>.onnx.",
+    )
+    cnn_parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=None,
+        help="Maximum number of calibration samples.",
+    )
+    cnn_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Calibration batch size.",
+    )
+    cnn_parser.add_argument(
+        "--device",
+        default="",
+        help="Torch device used to load the model (e.g. 'cpu', 'cuda:0').",
+    )
+    cnn_parser.add_argument(
+        "--pretrained",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Load pretrained weights for torchvision/timm models.",
+    )
+    cnn_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Print the result as JSON instead of key=value lines.",
+    )
+    cnn_parser.add_argument(
+        "--no-evaluate",
+        action="store_true",
+        help="Skip the evaluation stage.",
     )
 
-    llm_parser = subparsers.add_parser(
-        "llm",
-        help="LLM compression with llmcompressor",
+    lm_parser = subparsers.add_parser(
+        "lm",
+        help="Large-model optimization with llmcompressor",
     )
-    llm_parser.add_argument(
+    lm_parser.add_argument(
         "--model",
         required=True,
         help="Model name or path",
     )
-    llm_parser.add_argument("--recipe", default="", help="Compression recipe")
-    llm_parser.add_argument(
+    lm_parser.add_argument("--recipe", default="", help="Compression recipe")
+    lm_parser.add_argument(
         "--output-dir",
         default="",
         help="Output directory; defaults to tmp/<model>.<quant_mode>",
     )
-    llm_parser.add_argument(
+    lm_parser.add_argument(
         "--dataset",
         default="wikitext",
-        help=(
-            "Calibration dataset name or local path "
-            "supported by llmcompressor"
-        ),
+        help="Calibration dataset name or local path supported by llmcompressor",
     )
-    llm_parser.add_argument(
+    lm_parser.add_argument(
         "--dataset-config-name",
         default="wikitext-2-raw-v1",
-        help=(
-            "Dataset config name when the calibration dataset "
-            "requires one"
-        ),
+        help=("Dataset config name when the calibration dataset requires one"),
     )
-    llm_parser.add_argument(
+    lm_parser.add_argument(
         "--splits",
         default="train[:1]",
         help="Dataset split selector for calibration",
     )
-    llm_parser.add_argument(
+    lm_parser.add_argument(
         "--num-calibration-samples",
         type=int,
         default=1,
         help="Number of calibration samples to use for oneshot",
     )
-    llm_parser.add_argument(
+    lm_parser.add_argument(
         "--max-seq-length",
         type=int,
         default=32,
         help="Maximum sequence length for calibration tokenization",
     )
-    llm_parser.add_argument(
+    lm_parser.add_argument(
         "--trust-remote-code-model",
-        action="store_true",
-        default=True,
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="Allow custom model code from remote repositories",
     )
 
     return parser
 
 
+def _cnn_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    """Translate CNN CLI flags into ``build_optimize_config`` overrides."""
+    overrides: dict[str, Any] = {}
+    if args.model:
+        overrides["model_name"] = args.model
+    if args.dataset:
+        overrides["dataset_root"] = args.dataset
+    if args.quant_mode:
+        overrides["quant_mode"] = args.quant_mode
+    if args.device:
+        overrides["device"] = args.device
+    if args.pretrained is not None:
+        overrides["pretrained"] = args.pretrained
+
+    calibration: dict[str, int] = {}
+    if args.num_samples is not None:
+        calibration["num_samples"] = args.num_samples
+    if args.batch_size is not None:
+        calibration["batch_size"] = args.batch_size
+    if calibration:
+        overrides["calibration"] = calibration
+
+    # Supplying sparsity settings selects the sparsify algorithm.
+    sparsity: dict[str, Any] = {}
+    if args.sparsity is not None:
+        sparsity["sparsity"] = args.sparsity
+    if args.sparsity_mode is not None:
+        sparsity["mode"] = args.sparsity_mode
+    if sparsity:
+        overrides["sparsity"] = sparsity
+
+    return overrides
+
+
+def _run_cnn(args: argparse.Namespace) -> int:
+    config = build_optimize_config(args.config or None, **_cnn_overrides(args))
+    if args.output:
+        config.output_path = args.output
+
+    result = run_cnn_pipeline(
+        config=config,
+        evaluate_model=not args.no_evaluate,
+    )
+
+    payload: dict[str, Any] = {
+        "group": "cnn",
+        "model": result.config.model_name,
+        "dataset": result.config.dataset_root,
+        "task": result.config.task,
+        "quant_mode": (
+            result.config.quant.mode if result.config.quant is not None else None
+        ),
+        "algorithms": list(result.algorithms),
+        "output": str(result.onnx_path),
+    }
+    if result.evaluation is not None:
+        evaluation_payload: dict[str, Any] = {
+            "task": result.evaluation.task,
+            "num_samples": result.evaluation.num_samples,
+        }
+        for metric in (
+            "accuracy",
+            "mean_average_precision",
+            "map_50",
+            "map_75",
+            "mean_iou",
+        ):
+            value = getattr(result.evaluation, metric)
+            if value is not None:
+                evaluation_payload[metric] = value
+        payload["evaluation"] = evaluation_payload
+
+    if args.as_json:
+        _write_stdout(json.dumps(payload, indent=2))
+    else:
+        for key, value in payload.items():
+            if key == "evaluation":
+                continue
+            _write_stdout(f"{key}={value}")
+        if result.evaluation is not None:
+            _write_stdout(result.evaluation.summary())
+    return 0
+
+
+def _run_lm(args: argparse.Namespace) -> int:
+    output_dir_value = args.output_dir or build_default_output_path(args.model, "int8")
+    if output_dir_value.endswith(".onnx"):
+        output_dir_value = output_dir_value.rsplit(".onnx", 1)[0]
+
+    optimizer = LMOptimizer()
+    result = optimizer.optimize(
+        model=args.model,
+        output_dir=output_dir_value,
+        recipe=args.recipe or None,
+        dataset=args.dataset,
+        dataset_config_name=args.dataset_config_name,
+        splits=args.splits,
+        num_calibration_samples=args.num_calibration_samples,
+        max_seq_length=args.max_seq_length,
+        trust_remote_code_model=args.trust_remote_code_model,
+    )
+    _write_stdout(json.dumps(result, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
+    logging.basicConfig(
+        level=logging.DEBUG if getattr(args, "verbose", False) else logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    )
+
     if args.group == "cnn":
         try:
-            model, sample_input = resolve_cnn_model_and_sample_input(
-                args.model,
-                model_kind="auto",
-            )
-
-            dataset_kind = infer_dataset_kind_from_root(args.dataset)
-            task_name = infer_task_from_model_and_dataset(
-                args.model,
-                dataset_kind,
-            )
-
-            output_path_value = args.output or build_default_output_path(
-                args.model,
-                args.quant_mode,
-            )
-            output_path = Path(output_path_value)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-
-            config = CNNConfig(
-                model_name=args.model,
-                task=task_name,
-                dataset_kind=dataset_kind,
-                dataset_root=args.dataset,
-                quant_mode=args.quant_mode,
-                output_path=str(output_path),
-                use_dynamic_axes=False,
-            )
-
-            result = optimize_cnn_model(model, sample_input, config=config)
-            print({
-                "group": "cnn",
-                "model": args.model,
-                "dataset": args.dataset,
-                "task": task_name,
-                "dataset_kind": dataset_kind,
-                "quant_mode": args.quant_mode,
-                "output": str(result),
-            })
-            return 0
-        except Exception as exc:  # pragma: no cover
-            print(f"CNN optimization failed: {exc}")
+            return _run_cnn(args)
+        except Exception as exc:  # pragma: no cover - CLI error path
+            logger.error("CNN optimization failed: %s", exc, exc_info=True)
             return 2
 
-    if args.group == "llm":
-        if not args.model or args.model == "tiny":
-            print(
-                "LLM model must be a valid local path or Hugging Face "
-                "repo ID; 'tiny' is not a valid model identifier."
-            )
-            return 2
-
-        adapter = LLMCompressorAdapter()
+    if args.group == "lm":
         try:
-            output_dir_value = args.output_dir or build_default_output_path(
-                args.model,
-                args.quant_mode if hasattr(args, 'quant_mode') else 'int8',
-            )
-            if output_dir_value.endswith('.onnx'):
-                output_dir_value = output_dir_value.rsplit('.onnx', 1)[0]
-
-            result = adapter.compress(
-                model=args.model,
-                output_dir=output_dir_value,
-                recipe=args.recipe or None,
-                dataset=args.dataset,
-                dataset_config_name=args.dataset_config_name,
-                splits=args.splits,
-                num_calibration_samples=args.num_calibration_samples,
-                max_seq_length=args.max_seq_length,
-                trust_remote_code_model=args.trust_remote_code_model,
-            )
-            print(result)
-            return 0
+            return _run_lm(args)
         except RuntimeError as exc:
-            print(f"LLM compression unavailable: {exc}")
+            logger.error("Large-model optimization unavailable: %s", exc)
             return 2
-        except Exception as exc:  # pragma: no cover
-            print(f"LLM compression failed: {exc}")
+        except Exception as exc:  # pragma: no cover - CLI error path
+            logger.error("Large-model optimization failed: %s", exc, exc_info=True)
             return 2
 
     parser.print_help()

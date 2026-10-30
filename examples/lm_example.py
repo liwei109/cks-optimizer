@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from cks_optimizer.llm.llmcompressor_adapter import LLMCompressorAdapter
+import logging
 
+from cks_optimizer.lm.optimizer import LMOptimizer
 
 if __name__ == "__main__":
-    adapter = LLMCompressorAdapter()
-    result = adapter.compress(
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    optimizer = LMOptimizer()
+    result = optimizer.optimize(
         model="Qwen/Qwen2.5-0.5B-Instruct",
         output_dir="tmp/qwen2.5-0.5b-instruct.int8",
         recipe=None,
@@ -16,4 +18,4 @@ if __name__ == "__main__":
         max_seq_length=32,
         trust_remote_code_model=True,
     )
-    print(result)
+    logging.getLogger(__name__).info("Large-model optimization result: %s", result)

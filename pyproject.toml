@@ -5,32 +5,29 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cks-optimizer"
 version = "0.1.0"
-description = "Model optimization toolkit for CNN/vision models and LLM compression workflows."
+description = "CKS model optimizer for CNN and LM."
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "Li Wei" }]
+authors = [{ name = "Li Wei", email = "liwei.109@outlook.com" }]
 license = { text = "Apache-2.0" }
-keywords = ["modelopt", "llmcompressor", "quantization", "onnx", "cnn", "llm"]
+keywords = ["modelopt", "llmcompressor", "quantization", "onnx", "cnn", "large-model"]
 dependencies = [
   "torch",
+  "torchvision",
   "onnx",
   "onnxruntime",
+  "onnxsim",
   "numpy",
+  "Pillow",
+  "PyYAML",
+  "timm",
 ]
 
 [project.optional-dependencies]
-modelopt = ["modelopt"]
-llm = ["llmcompressor", "transformers"]
-dev = [
-  "ruff>=0.5",
-  "mypy>=1.10",
-]
+coco = ["pycocotools"]
 
 [project.scripts]
 cks-opt = "cks_optimizer.cli:main"
-
-[tool.setuptools]
-include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -1,0 +1,24 @@
+# COCO detection recipe. The ONNX model must return boxes, labels, and scores.
+#
+#   cks-opt cnn --config recipes/cnn/base_det.yaml
+#
+# Supply a detector ONNX model with boxes, labels, and scores outputs.
+# COCO layout follows train2017/ and val2017/ with annotations/ at the root.
+model_name: models/coco_detector.onnx
+dataset_root: datasets/coco
+task: detection
+input_shape: [1, 3, 640, 640]
+evaluation_split: val2017
+
+quant:
+  mode: int8
+
+calibration:
+  num_samples: 64
+  batch_size: 1
+  split: train2017
+
+export:
+  output_path: tmp/coco_detector.int8.onnx
+  opset_version: 17
+  output_names: [boxes, labels, scores]
