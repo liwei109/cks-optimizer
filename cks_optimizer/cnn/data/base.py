@@ -20,6 +20,16 @@ SUPPORTED_IMAGE_EXTENSIONS = {
 class VisionDatasetAdapter(ABC):
     """Abstract adapter for CNN vision datasets."""
 
+    @classmethod
+    def matches(cls, root: Path) -> bool:
+        """Whether the directory layout matches this dataset kind.
+
+        Used by kind inference: the first registered adapter whose
+        ``matches`` returns True wins, so specific layouts must be
+        checked before generic ones.
+        """
+        return False
+
     def __init__(self, root: str, split: str = "train", **kwargs: Any):
         self.root = Path(root)
         self.split = split
@@ -96,6 +106,13 @@ class ImageFolderDatasetAdapter(VisionDatasetAdapter):
 class CocoDatasetAdapter(VisionDatasetAdapter):
     """COCO dataset adapter for detection / segmentation tasks."""
 
+    @classmethod
+    def matches(cls, root: Path) -> bool:
+        return any(
+            "instances" in candidate.name.lower()
+            for candidate in root.rglob("*.json")
+        )
+
     def _load_samples(self) -> list[dict[str, Any]]:
         root = self._resolve_split_root()
         annotation_candidates: list[Path] = []
@@ -145,6 +162,10 @@ class CocoDatasetAdapter(VisionDatasetAdapter):
 class VocDatasetAdapter(VisionDatasetAdapter):
     """VOC dataset adapter for detection / segmentation tasks."""
 
+    @classmethod
+    def matches(cls, root: Path) -> bool:
+        return (root / "JPEGImages").exists() and (root / "Annotations").exists()
+
     def _load_samples(self) -> list[dict[str, Any]]:
         target = self._resolve_split_root()
         jpeg_root = target / "JPEGImages"
@@ -182,6 +203,10 @@ class VocDatasetAdapter(VisionDatasetAdapter):
 
 class CustomDatasetAdapter(VisionDatasetAdapter):
     """Custom dataset adapter for user-specific formats."""
+
+    @classmethod
+    def matches(cls, root: Path) -> bool:
+        return any(root.rglob("*.json"))
 
     def _load_samples(self) -> list[dict[str, Any]]:
         root = self._resolve_split_root()

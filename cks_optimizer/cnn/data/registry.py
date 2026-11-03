@@ -11,11 +11,15 @@ from cks_optimizer.cnn.data.base import (
 )
 
 
+# Insertion order doubles as layout-inference priority: the first adapter
+# whose matches() accepts a directory wins, so specific layouts (voc, coco)
+# must be registered before generic ones (custom). "imagefolder" never
+# matches and acts as the fallback kind.
 DATASET_REGISTRY: dict[str, type[VisionDatasetAdapter]] = {
-    "imagefolder": ImageFolderDatasetAdapter,
-    "coco": CocoDatasetAdapter,
     "voc": VocDatasetAdapter,
+    "coco": CocoDatasetAdapter,
     "custom": CustomDatasetAdapter,
+    "imagefolder": ImageFolderDatasetAdapter,
 }
 
 

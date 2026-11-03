@@ -13,6 +13,7 @@ license = { text = "Apache-2.0" }
 keywords = ["modelopt", "llmcompressor", "quantization", "onnx", "cnn", "llm"]
 dependencies = [
   "torch",
+  "torchvision",
   "onnx",
   "onnxruntime",
   "numpy",

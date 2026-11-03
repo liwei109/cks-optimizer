@@ -9,7 +9,9 @@ from cks_optimizer.cnn.config import (
     infer_dataset_kind_from_root,
     infer_task_from_model_and_dataset,
 )
+from cks_optimizer.cnn.data.registry import DATASET_REGISTRY
 from cks_optimizer.cnn.model_loader import resolve_cnn_model_and_sample_input
+from cks_optimizer.cnn.pipeline import build_calibration_loader_from_config
 from cks_optimizer.llm.llmcompressor_adapter import LLMCompressorAdapter
 
 
@@ -32,6 +34,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Dataset root or annotation file",
     )
     cnn_parser.add_argument("--quant-mode", default="int8")
+    cnn_parser.add_argument(
+        "--dataset-kind",
+        default="auto",
+        choices=["auto", *DATASET_REGISTRY.keys()],
+        help=(
+            "Dataset kind; 'auto' (default) infers it from the "
+            "dataset directory layout"
+        ),
+    )
     cnn_parser.add_argument(
         "--output",
         default="",
@@ -107,7 +118,11 @@ def main(argv: list[str] | None = None) -> int:
                 model_kind="auto",
             )
 
-            dataset_kind = infer_dataset_kind_from_root(args.dataset)
+            dataset_kind = (
+                args.dataset_kind
+                if args.dataset_kind != "auto"
+                else infer_dataset_kind_from_root(args.dataset)
+            )
             task_name = infer_task_from_model_and_dataset(
                 args.model,
                 dataset_kind,
@@ -130,7 +145,23 @@ def main(argv: list[str] | None = None) -> int:
                 use_dynamic_axes=False,
             )
 
-            result = optimize_cnn_model(model, sample_input, config=config)
+            calibration_loader = build_calibration_loader_from_config(
+                config,
+                task_name,
+            )
+            if calibration_loader is None:
+                print(
+                    f"Warning: no calibration images found under "
+                    f"'{args.dataset}' (kind: {dataset_kind}); falling back "
+                    f"to a single random-sample calibration."
+                )
+
+            result = optimize_cnn_model(
+                model,
+                sample_input,
+                config=config,
+                calibration_loader=calibration_loader,
+            )
             print({
                 "group": "cnn",
                 "model": args.model,
@@ -138,6 +169,11 @@ def main(argv: list[str] | None = None) -> int:
                 "task": task_name,
                 "dataset_kind": dataset_kind,
                 "quant_mode": args.quant_mode,
+                "calibration_images": (
+                    len(calibration_loader.dataset)
+                    if calibration_loader is not None
+                    else 0
+                ),
                 "output": str(result),
             })
             return 0

@@ -4,6 +4,8 @@ import json
 
 import pytest
 
+from cks_optimizer.cli import _build_parser
+from cks_optimizer.cnn.config import infer_dataset_kind_from_root
 from cks_optimizer.cnn.data.base import (
     CocoDatasetAdapter,
     CustomDatasetAdapter,
@@ -184,3 +186,75 @@ def test_task_registry_accepts_expected_names():
 
     with pytest.raises(ValueError):
         get_task_name("unknown")
+
+
+def test_adapter_matches_detects_layout_signatures(tmp_path):
+    voc_root = tmp_path / "voc"
+    (voc_root / "JPEGImages").mkdir(parents=True)
+    (voc_root / "Annotations").mkdir()
+    assert VocDatasetAdapter.matches(voc_root)
+    assert not CocoDatasetAdapter.matches(voc_root)
+
+    coco_root = tmp_path / "coco"
+    coco_root.mkdir()
+    (coco_root / "instances_val2017.json").write_text("{}")
+    assert CocoDatasetAdapter.matches(coco_root)
+    assert not VocDatasetAdapter.matches(coco_root)
+
+    custom_root = tmp_path / "custom"
+    custom_root.mkdir()
+    (custom_root / "notes.json").write_text("{}")
+    assert CustomDatasetAdapter.matches(custom_root)
+    assert not CocoDatasetAdapter.matches(custom_root)
+
+
+def test_infer_dataset_kind_respects_registry_priority(tmp_path):
+    # VOC layout wins over an instances.json also present in the tree.
+    root = tmp_path / "mixed"
+    (root / "JPEGImages").mkdir(parents=True)
+    (root / "Annotations").mkdir()
+    (root / "instances_val2017.json").write_text("{}")
+
+    assert infer_dataset_kind_from_root(root) == "voc"
+
+
+def test_infer_dataset_kind_falls_back_to_imagefolder(tmp_path):
+    plain_root = tmp_path / "plain"
+    plain_root.mkdir()
+    (plain_root / "img.jpg").write_bytes(b"jpg")
+
+    assert infer_dataset_kind_from_root(plain_root) == "imagefolder"
+    assert infer_dataset_kind_from_root(tmp_path / "missing") == "imagefolder"
+
+
+def test_cnn_parser_accepts_dataset_kind_override():
+    parser = _build_parser()
+
+    args = parser.parse_args(
+        [
+            "cnn",
+            "--model",
+            "resnet18",
+            "--dataset",
+            "./tmp",
+            "--dataset-kind",
+            "coco",
+        ]
+    )
+    assert args.dataset_kind == "coco"
+    assert parser.parse_args(
+        ["cnn", "--model", "resnet18", "--dataset", "./tmp"]
+    ).dataset_kind == "auto"
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "cnn",
+                "--model",
+                "resnet18",
+                "--dataset",
+                "./tmp",
+                "--dataset-kind",
+                "unknown",
+            ]
+        )

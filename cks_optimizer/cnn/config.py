@@ -5,24 +5,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from cks_optimizer.cnn.data.registry import DATASET_REGISTRY
+
 
 def infer_dataset_kind_from_root(dataset_root: str | Path | None) -> str:
-    """Infer a CNN dataset kind from the filesystem layout."""
+    """Infer a CNN dataset kind from the filesystem layout.
+
+    Iterates DATASET_REGISTRY in priority order and returns the first
+    adapter whose ``matches`` accepts the layout; falls back to
+    "imagefolder" when nothing matches.
+    """
     root = Path(dataset_root) if dataset_root else Path(".")
     if not root.exists() or not root.is_dir():
         return "imagefolder"
 
-    if (root / "JPEGImages").exists() and (root / "Annotations").exists():
-        return "voc"
-
-    json_candidates = list(root.rglob("*.json"))
-    if any(
-        "instances" in candidate.name.lower()
-        for candidate in json_candidates
-    ):
-        return "coco"
-    if json_candidates:
-        return "custom"
+    for kind, adapter_cls in DATASET_REGISTRY.items():
+        if adapter_cls.matches(root):
+            return kind
 
     return "imagefolder"
 
@@ -70,6 +69,9 @@ class CNNConfig:
     input_shape: tuple[int, ...] = (1, 3, 224, 224)
     use_dynamic_axes: bool = True
     calibration_samples: int = 32
+    calibration_batch_size: int = 16
+    normalize_mean: tuple[float, ...] = (0.485, 0.456, 0.406)
+    normalize_std: tuple[float, ...] = (0.229, 0.224, 0.225)
     extra: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):

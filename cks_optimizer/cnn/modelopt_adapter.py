@@ -55,6 +55,7 @@ class ModelOptTorchAdapter:
         model: torch.nn.Module,
         sample_input: Any,
         output_path: Optional[str] = None,
+        calibration_loader: Any = None,
         **kwargs: Any,
     ) -> Path:
         self._validate_backend()
@@ -64,8 +65,18 @@ class ModelOptTorchAdapter:
         if kwargs:
             quant_cfg.update(kwargs)
 
-        def forward_loop(m):
-            return m(sample_input)
+        if calibration_loader is not None:
+            # The dataset consumption point: data flows through the model here.
+            # Each forward triggers TensorQuantizer hooks that collect absmax
+            # statistics over real activation distributions. Batches are stacked
+            # tensors (classification) or List[Tensor] (detection) — both are
+            # passed to the model as-is.
+            def forward_loop(m):
+                for batch in calibration_loader:
+                    m(batch)
+        else:
+            def forward_loop(m):
+                return m(sample_input)
 
         quantized_model = mtq.quantize(
             model,

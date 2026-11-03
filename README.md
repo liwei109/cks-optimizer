@@ -87,7 +87,9 @@ python -m cks_optimizer cnn \
   --quant-mode int8
 ```
 
-The CLI automatically infers the dataset kind and task from the model/data context and writes the result to `tmp/mobilenetv2_100.int8.onnx` by default. You can still override the output path with `--output`, but it is not required.
+The CLI automatically infers the dataset kind and task from the model/data context and writes the result to `tmp/mobilenetv2_100.int8.onnx` by default. If the inferred dataset kind is wrong (e.g. a COCO image directory without annotation files), override it with `--dataset-kind coco`. You can still override the output path with `--output`, but it is not required.
+
+During quantization the model is calibrated on real images from the dataset directory (up to `CNNConfig.calibration_samples` images, in batches of `calibration_batch_size`); if the directory contains no usable images, the CLI warns and falls back to a single random-sample calibration.
 
 ## LLM path
 
