@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cks-compressor"
+version = "0.1.0"
+description = "Model compression framework: quantization / sparsity / pruning / mixed-precision search / export"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Li Wei" }]
+license = { text = "Apache-2.0" }
+keywords = [
+  "modelopt",
+  "llmcompressor",
+  "quantization",
+  "sparsity",
+  "onnx",
+  "cnn",
+  "llm",
+]
+
+dependencies = [
+  "torch",
+  "pyyaml",
+]
+
+[project.optional-dependencies]
+# CV path: ModelOpt quantization + QDQ ONNX export
+cv = [
+  "modelopt",
+  "torchvision",
+  "onnx",
+  "onnxsim",
+  "pillow",
+]
+# LM path: llmcompressor Oneshot
+lm = [
+  "llmcompressor",
+  "transformers",
+  "datasets",
+]
+dev = [
+  "ruff>=0.5",
+  "mypy>=1.10",
+]
+
+[project.scripts]
+cks-compressor = "compressor.cli.main:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["compressor*"]
