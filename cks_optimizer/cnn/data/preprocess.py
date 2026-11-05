@@ -12,6 +12,7 @@ Migrated from the ModelOpt torch-route demos:
 
 from __future__ import annotations
 
+import random
 from typing import Any, Iterable, Optional
 
 import torchvision
@@ -77,6 +78,7 @@ def build_calibration_loader(
     max_samples: Optional[int] = None,
     mean: Optional[Iterable[float]] = None,
     std: Optional[Iterable[float]] = None,
+    seed: int = 0,
 ) -> Optional[DataLoader]:
     """Build a calibration DataLoader from a dataset adapter.
 
@@ -84,12 +86,17 @@ def build_calibration_loader(
     flow through the model inside the calibration forward loop, where
     TensorQuantizer hooks collect activation statistics.
 
+    When `max_samples` is smaller than the dataset, samples are drawn
+    randomly (seeded for reproducibility) instead of taking the first N
+    entries — adapters list files in sorted order, so a plain prefix would
+    let one class or folder dominate the calibration statistics.
+
     Returns None when the adapter yields no usable image paths, so callers
     can fall back to a static sample input.
     """
     samples = list(adapter)
-    if max_samples is not None:
-        samples = samples[:max_samples]
+    if max_samples is not None and len(samples) > max_samples:
+        samples = random.Random(seed).sample(samples, max_samples)
     image_paths = [
         sample["image_path"]
         for sample in samples

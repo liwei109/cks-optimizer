@@ -108,6 +108,64 @@ def test_build_calibration_loader_caps_samples(image_root):
     assert batches[0].shape[0] == 3
 
 
+@pytest.fixture
+def large_image_root(tmp_path):
+    root = tmp_path / "images"
+    root.mkdir()
+    for index in range(40):
+        _write_image(root / f"img{index:02d}.jpg")
+    return root
+
+
+def test_build_calibration_loader_samples_randomly_not_prefix(large_image_root):
+    adapter = ImageFolderDatasetAdapter(str(large_image_root))
+    all_paths = [sample["image_path"] for sample in adapter]
+
+    loader = build_calibration_loader(
+        adapter,
+        task="classification",
+        batch_size=8,
+        max_samples=8,
+    )
+
+    selected = loader.dataset.image_paths
+    assert len(selected) == 8
+    # Random draw must not degenerate to the sorted first-N prefix.
+    assert selected != all_paths[:8]
+    assert set(selected) <= set(all_paths)
+
+
+def test_build_calibration_loader_sampling_is_reproducible(large_image_root):
+    adapter = ImageFolderDatasetAdapter(str(large_image_root))
+
+    first = build_calibration_loader(
+        adapter, task="classification", batch_size=8, max_samples=8
+    )
+    second = build_calibration_loader(
+        adapter, task="classification", batch_size=8, max_samples=8
+    )
+    other_seed = build_calibration_loader(
+        adapter, task="classification", batch_size=8, max_samples=8, seed=7
+    )
+
+    assert first.dataset.image_paths == second.dataset.image_paths
+    assert other_seed.dataset.image_paths != first.dataset.image_paths
+
+
+def test_build_calibration_loader_keeps_all_when_cap_exceeds_size(image_root):
+    adapter = ImageFolderDatasetAdapter(str(image_root))
+    all_paths = [sample["image_path"] for sample in adapter]
+
+    loader = build_calibration_loader(
+        adapter,
+        task="classification",
+        batch_size=2,
+        max_samples=100,
+    )
+
+    assert sorted(loader.dataset.image_paths) == sorted(all_paths)
+
+
 def test_build_calibration_loader_detection_keeps_image_list(tmp_path):
     root = tmp_path / "images"
     root.mkdir()
