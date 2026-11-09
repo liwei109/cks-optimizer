@@ -6,7 +6,7 @@ conda activate cks-opt
 
 mkdir -p tmp
 
-python -m cks_optimizer llm \
+python -m cks_optimizer lm \
   --model Qwen/Qwen2.5-0.5B-Instruct \
   --recipe '' \
   --dataset wikitext \
