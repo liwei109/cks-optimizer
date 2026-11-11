@@ -123,6 +123,43 @@ def test_build_optimize_config_from_dict():
     assert config.export.output_path == "out/model.onnx"
 
 
+def test_build_optimize_config_accepts_task_alongside_grouped_sections():
+    config = build_optimize_config(
+        {
+            "task": "segmentation",
+            "model": {"name": "deeplabv3", "input_shape": [1, 3, 520, 520]},
+            "data": {"root": "datasets/voc"},
+        }
+    )
+
+    assert config.task == "segmentation"
+    assert config.model_name == "deeplabv3"
+
+
+def test_build_optimize_config_reads_evaluation_batch_size():
+    config = build_optimize_config(
+        {
+            "model": {"name": "detector"},
+            "data": {"evaluation": {"split": "val2017", "batch_size": 8}},
+        }
+    )
+
+    assert config.evaluation_split == "val2017"
+    assert config.evaluation_batch_size == 8
+
+
+def test_build_optimize_config_rejects_nonpositive_evaluation_batch_size():
+    with pytest.raises(ValueError, match="evaluation_batch_size must be >= 1"):
+        build_optimize_config({"evaluation_batch_size": 0})
+
+
+def test_build_optimize_config_rejects_task_inside_model_section():
+    with pytest.raises(ValueError, match="Unknown model config key 'task'"):
+        build_optimize_config(
+            {"model": {"name": "deeplabv3", "task": "segmentation"}}
+        )
+
+
 def test_build_optimize_config_legacy_flat_keys():
     config = build_optimize_config(
         {
@@ -157,6 +194,28 @@ def test_shipped_recipes_are_valid(recipe):
     config = build_optimize_config(str(recipe))
     assert config.model_name
     assert config.dataset_root
+    expected_tasks = {
+        "base_cls.yaml": "classification",
+        "base_det.yaml": "detection",
+        "base_seg.yaml": "segmentation",
+        "base_sparse_cls.yaml": "classification",
+    }
+    assert config.task == expected_tasks[recipe.name]
+    if recipe.name == "base_det.yaml":
+        assert config.calibration.split == "val2017"
+        assert config.evaluation_split == "val2017"
+        assert config.evaluation_batch_size == 8
+        assert config.export.output_names == ["output0"]
+    if recipe.name == "base_sparse_cls.yaml":
+        assert config.quant is None
+        assert config.sparsity is not None
+    else:
+        assert config.quant.weights.bits == 8
+        assert config.quant.weights.scheme == "symmetric"
+        assert config.quant.weights.granularity == "per_channel"
+        assert config.quant.activations.bits == 8
+        assert config.quant.activations.scheme == "symmetric"
+        assert config.quant.activations.granularity == "per_tensor"
     assert config.effective_algorithms
     if recipe.name == "base_sparse_cls.yaml":
         assert config.quant is None
@@ -549,6 +608,32 @@ def test_run_cnn_pipeline_end_to_end(tmp_path):
     assert result.evaluation.num_samples >= 1
     assert result.evaluation.task == "classification"
     assert result.evaluation.accuracy is not None
+
+
+def test_run_cnn_pipeline_evaluates_without_optimization_or_calibration(tmp_path):
+    from PIL import Image
+
+    image_path = tmp_path / "images" / "val" / "cat" / "sample.png"
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (32, 32), color=(120, 120, 120)).save(image_path)
+    output_path = tmp_path / "tiny-evaluation.onnx"
+    config = OptimizeConfig(
+        model_name="tiny",
+        dataset_root=str(tmp_path / "images"),
+        input_shape=(1, 3, 32, 32),
+        export=ExportConfig(use_dynamic_axes=False),
+    )
+    config.output_path = str(output_path)
+
+    result = run_cnn_pipeline(config=config, model=TinyModel().eval())
+
+    assert result.algorithms == ()
+    assert result.data.calib_data == []
+    assert result.data.num_samples == 0
+    assert result.sample_input.shape == (1, 3, 32, 32)
+    assert result.onnx_path == output_path
+    assert result.evaluation is not None
+    assert result.evaluation.num_samples == 1
 
 
 def test_run_cnn_pipeline_sample_input_comes_from_dataset(tmp_path):

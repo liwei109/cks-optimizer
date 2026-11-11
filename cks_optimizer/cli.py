@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import sys
+from pathlib import Path
 from typing import Any
 
 from cks_optimizer.cnn import run_cnn_pipeline
@@ -39,7 +40,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable debug logging.",
     )
-    subparsers = parser.add_subparsers(dest="group")
+    subparsers = parser.add_subparsers(dest="model_type")
 
     cnn_parser = subparsers.add_parser(
         "cnn",
@@ -99,6 +100,22 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Calibration batch size.",
+    )
+    cnn_parser.add_argument(
+        "--calibration-split",
+        default="",
+        help="Dataset split used for calibration (e.g. train2017 or val2017).",
+    )
+    cnn_parser.add_argument(
+        "--evaluation-split",
+        default="",
+        help="Held-out dataset split used for evaluation (e.g. val2017).",
+    )
+    cnn_parser.add_argument(
+        "--evaluation-batch-size",
+        type=int,
+        default=None,
+        help="Evaluation batch size; static ONNX inputs still limit the maximum.",
     )
     cnn_parser.add_argument(
         "--device",
@@ -189,13 +206,19 @@ def _cnn_overrides(args: argparse.Namespace) -> dict[str, Any]:
     if args.pretrained is not None:
         overrides["pretrained"] = args.pretrained
 
-    calibration: dict[str, int] = {}
+    calibration: dict[str, Any] = {}
     if args.num_samples is not None:
         calibration["num_samples"] = args.num_samples
     if args.batch_size is not None:
         calibration["batch_size"] = args.batch_size
+    if args.calibration_split:
+        calibration["split"] = args.calibration_split
     if calibration:
         overrides["calibration"] = calibration
+    if args.evaluation_split:
+        overrides["evaluation_split"] = args.evaluation_split
+    if args.evaluation_batch_size is not None:
+        overrides["evaluation_batch_size"] = args.evaluation_batch_size
 
     # Supplying sparsity settings selects the sparsify algorithm.
     sparsity: dict[str, Any] = {}
@@ -213,6 +236,19 @@ def _run_cnn(args: argparse.Namespace) -> int:
     config = build_optimize_config(args.config or None, **_cnn_overrides(args))
     if args.output:
         config.output_path = args.output
+    if (
+        not config.effective_algorithms
+        and not args.config
+        and args.pretrained is None
+        and not Path(config.model_name).is_file()
+        and Path(config.model_name).suffix.lower()
+        not in {".onnx", ".pt", ".pth", ".ckpt", ".bin"}
+    ):
+        config.pretrained = True
+        logger.info(
+            "Evaluation-only run: loading pretrained weights for model %r.",
+            config.model_name,
+        )
 
     result = run_cnn_pipeline(
         config=config,
@@ -246,7 +282,6 @@ def _run_cnn(args: argparse.Namespace) -> int:
             if value is not None:
                 evaluation_payload[metric] = value
         payload["evaluation"] = evaluation_payload
-
     if args.as_json:
         _write_stdout(json.dumps(payload, indent=2))
     else:
@@ -289,14 +324,14 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
 
-    if args.group == "cnn":
+    if args.model_type == "cnn":
         try:
             return _run_cnn(args)
         except Exception as exc:  # pragma: no cover - CLI error path
             logger.error("CNN optimization failed: %s", exc, exc_info=True)
             return 2
 
-    if args.group == "lm":
+    if args.model_type == "lm":
         try:
             return _run_lm(args)
         except RuntimeError as exc:

@@ -9,6 +9,7 @@ from .config import (
     ExportConfig,
     OptimizeConfig,
     QuantConfig,
+    QuantizerSettings,
     SparsityConfig,
     build_optimize_config,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "ProcessedData",
     "QUANT_MODES",
     "QuantConfig",
+    "QuantizerSettings",
     "SPARSITY_MODES",
     "SparsityConfig",
     "TRT_ONLY_QUANT_MODES",

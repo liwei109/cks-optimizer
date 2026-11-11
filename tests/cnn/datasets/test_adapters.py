@@ -4,6 +4,7 @@ import pytest
 
 from cks_optimizer.cnn.datasets.registry import (
     DATASET_REGISTRY,
+    _coco_paths,
     normalize_dataset,
 )
 
@@ -31,3 +32,37 @@ def test_normalize_dataset_rejects_unsupported_datasets(kind):
 
 def test_registry_contains_only_task_datasets():
     assert set(DATASET_REGISTRY) == {"imagenet", "coco", "voc"}
+
+
+def test_coco_paths_resolve_2017_splits_from_short_names(tmp_path):
+    root = tmp_path / "coco"
+    annotations = root / "annotations"
+    annotations.mkdir(parents=True)
+    for split in ("train2017", "val2017"):
+        (root / split).mkdir(parents=True)
+        (annotations / f"instances_{split}.json").touch()
+
+    assert _coco_paths(root, "train") == (
+        root / "train2017",
+        root / "annotations" / "instances_train2017.json",
+    )
+    assert _coco_paths(root, "val") == (
+        root / "val2017",
+        root / "annotations" / "instances_val2017.json",
+    )
+    assert _coco_paths(root, "validation") == (
+        root / "val2017",
+        root / "annotations" / "instances_val2017.json",
+    )
+
+
+def test_coco_paths_resolve_unlabeled_test2017_images(tmp_path):
+    root = tmp_path / "coco"
+    (root / "images" / "test2017").mkdir(parents=True)
+    (root / "annotations").mkdir()
+    (root / "annotations" / "image_info_test2017.json").touch()
+
+    assert _coco_paths(root, "test2017") == (
+        root / "images" / "test2017",
+        root / "annotations" / "image_info_test2017.json",
+    )

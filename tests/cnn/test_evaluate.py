@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
@@ -16,7 +17,11 @@ from cks_optimizer.cnn import (
     export_onnx,
 )
 from cks_optimizer.cnn.datasets import data_process
-from cks_optimizer.cnn.evaluate import evaluate, resolve_input_name
+from cks_optimizer.cnn.evaluate import (
+    _yolov5_outputs,
+    evaluate,
+    resolve_input_name,
+)
 
 
 class ClassificationModel(torch.nn.Module):
@@ -44,8 +49,26 @@ class CocoDetectionModel(torch.nn.Module):
         self.register_buffer("scores", torch.tensor([[0.99]]))
 
     def forward(self, image):
-        input_signal = image.sum() * 1e-6
-        return self.boxes + input_signal, self.labels, self.scores + input_signal
+        input_signal = image.sum(dim=(1, 2, 3)).reshape(-1, 1, 1) * 1e-6
+        return (
+            self.boxes.expand(image.shape[0], -1, -1) + input_signal,
+            self.labels.expand(image.shape[0], -1),
+            self.scores.expand(image.shape[0], -1) + input_signal.reshape(-1, 1),
+        )
+
+
+class YoloV5RawModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        predictions = torch.zeros(1, 2, 85)
+        predictions[0, 0, :5] = torch.tensor([8.0, 8.0, 8.0, 8.0, 0.99])
+        predictions[0, 0, 5] = 0.99
+        predictions[0, 1, :5] = torch.tensor([8.0, 8.0, 8.0, 8.0, 0.98])
+        predictions[0, 1, 5] = 0.99
+        self.register_buffer("predictions", predictions)
+
+    def forward(self, image):
+        return self.predictions + image.sum() * 1e-8
 
 
 def _export(
@@ -105,26 +128,35 @@ def test_voc_reports_mean_iou(tmp_path):
     assert result.mean_iou == pytest.approx(1 / 3)
 
 
-def _create_coco_split(root: Path, split: str) -> None:
+def _create_coco_split(root: Path, split: str, *, image_count: int = 1) -> None:
     image_dir = root / split / "images"
     image_dir.mkdir(parents=True)
-    Image.new("RGB", (32, 32), color=(100, 100, 100)).save(image_dir / "sample.jpg")
-    annotation_dir = root / "annotations"
-    annotation_dir.mkdir(exist_ok=True)
-    payload = {
-        "info": {},
-        "licenses": [],
-        "images": [{"id": 7, "file_name": "sample.jpg", "width": 32, "height": 32}],
-        "annotations": [
+    images = []
+    annotations = []
+    for index in range(image_count):
+        image_id = 7 + index
+        file_name = f"sample-{index}.jpg"
+        Image.new("RGB", (32, 32), color=(100, 100, 100)).save(image_dir / file_name)
+        images.append(
+            {"id": image_id, "file_name": file_name, "width": 32, "height": 32}
+        )
+        annotations.append(
             {
-                "id": 1,
-                "image_id": 7,
+                "id": index + 1,
+                "image_id": image_id,
                 "category_id": 1,
                 "bbox": [4, 4, 8, 8],
                 "area": 64,
                 "iscrowd": 0,
             }
-        ],
+        )
+    annotation_dir = root / "annotations"
+    annotation_dir.mkdir(exist_ok=True)
+    payload = {
+        "info": {},
+        "licenses": [],
+        "images": images,
+        "annotations": annotations,
         "categories": [{"id": 1, "name": "object", "supercategory": "object"}],
     }
     (annotation_dir / f"instances_{split}.json").write_text(json.dumps(payload))
@@ -157,6 +189,107 @@ def test_coco_reports_standard_bbox_map(tmp_path):
     assert result.mean_average_precision == pytest.approx(1.0)
     assert result.map_50 == pytest.approx(1.0)
     assert result.map_75 == pytest.approx(1.0)
+
+
+def test_coco_evaluation_uses_configured_dynamic_batch(tmp_path, monkeypatch):
+    pytest.importorskip("pycocotools")
+    import importlib
+
+    evaluation_module = importlib.import_module("cks_optimizer.cnn.evaluate")
+    root = tmp_path / "coco"
+    _create_coco_split(root, "val2017", image_count=2)
+    config = OptimizeConfig(
+        model_name="detector",
+        task="detection",
+        dataset_root=str(root),
+        input_shape=(1, 3, 32, 32),
+        evaluation_split="val2017",
+        evaluation_batch_size=2,
+    )
+    data, _ = data_process(config, include_calibration=False, include_evaluation=True)
+    onnx_path = _export(
+        CocoDetectionModel(),
+        tmp_path / "detector-batched.onnx",
+        output_names=["boxes", "labels", "scores"],
+        dynamic_batch=True,
+    )
+
+    original_create_session = evaluation_module._create_session
+    batch_sizes = []
+
+    class RecordingSession:
+        def __init__(self, session):
+            self.session = session
+
+        def get_inputs(self):
+            return self.session.get_inputs()
+
+        def get_outputs(self):
+            return self.session.get_outputs()
+
+        def run(self, output_names, inputs):
+            batch_sizes.append(next(iter(inputs.values())).shape[0])
+            return self.session.run(output_names, inputs)
+
+    monkeypatch.setattr(
+        evaluation_module,
+        "_create_session",
+        lambda path, providers: RecordingSession(original_create_session(path, providers)),
+    )
+    result = evaluate(
+        onnx_path,
+        data.evaluation_dataset,
+        task="detection",
+        config=config,
+    )
+
+    assert result.num_samples == 2
+    assert result.mean_average_precision == pytest.approx(1.0)
+    assert batch_sizes == [2]
+
+
+def test_coco_evaluates_yolov5_raw_output(tmp_path):
+    pytest.importorskip("pycocotools")
+    root = tmp_path / "coco"
+    _create_coco_split(root, "train2017")
+    _create_coco_split(root, "val2017")
+    config = OptimizeConfig(
+        model_name="yolov5s",
+        task="detection",
+        dataset_root=str(root),
+        input_shape=(1, 3, 32, 32),
+        evaluation_split="val2017",
+        calibration=CalibrationConfig(split="train2017"),
+    )
+    data, _ = data_process(config, include_evaluation=True)
+    onnx_path = _export(
+        YoloV5RawModel(),
+        tmp_path / "yolov5.onnx",
+        output_names=["output0"],
+    )
+
+    result = evaluate(onnx_path, data.evaluation_dataset, task="detection")
+
+    assert result.num_samples == 1
+    assert result.mean_average_precision == pytest.approx(1.0)
+    assert result.map_50 == pytest.approx(1.0)
+    assert result.map_75 == pytest.approx(1.0)
+
+
+def test_yolov5_boxes_are_unletterboxed_to_original_image():
+    raw = np.zeros((1, 1, 85), dtype=np.float32)
+    raw[0, 0, :6] = [16, 16, 8, 8, 0.9, 0.9]
+
+    boxes, labels, scores = _yolov5_outputs(
+        raw,
+        valid_category_ids={1},
+        input_size=(32, 32),
+        original_size=(32, 64),
+    )
+
+    np.testing.assert_allclose(boxes, [[24, 8, 40, 24]])
+    np.testing.assert_array_equal(labels, [1])
+    np.testing.assert_allclose(scores, [0.81])
 
 
 def test_evaluate_skips_when_disabled():

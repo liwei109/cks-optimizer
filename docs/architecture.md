@@ -48,6 +48,26 @@ returns an `OptimizationResult`. A configured `quant` section runs quantization;
 a configured `sparsity` section runs sparsification. If both are present, the
 pipeline runs `["sparsify", "quantize"]` — sparsity first, then quantization.
 
+CNN recipes keep `task` at the top level, alongside the `model`, `data`,
+`optimize`, and `export` sections. The `model` section describes only the model
+itself; for example, use `task: segmentation` rather than nesting `task` under
+`model`.
+
+INT8 recipes may define `weights` and `activations` under
+`optimize.quantization`, with `bits`, `scheme`, and `granularity`
+(`per_tensor`, `per_channel`, or `per_group`). `per_group` also requires a
+positive `group_size`; `axis` optionally overrides the channel axis. The
+current PyTorch ModelOpt backend supports symmetric integer quantization only,
+so `scheme: asymmetric` is rejected rather than silently treated as symmetric.
+Weight per-channel quantization defaults to axis 0, activation per-channel to
+axis 1, and per-group quantization groups values along the last tensor axis.
+
+Calibration batches use `data.calibration.batch_size` (or `--batch-size`), and
+evaluation batches use `data.evaluation.batch_size` (or
+`--evaluation-batch-size`). Evaluation defaults to 16. The pipeline enables
+dynamic batches when loading static-batch-one YOLOv5 ONNX models; other static
+ONNX inputs are safely limited to their declared batch size.
+
 Two details worth knowing:
 
 - **Stage 3 supplies the input tensors.** The calibration batches it returns are

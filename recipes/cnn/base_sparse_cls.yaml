@@ -2,23 +2,26 @@
 #
 #   cks-opt cnn --config recipes/cnn/base_sparse_cls.yaml
 #
-# Remove the `quant` section to run sparsification without quantization.
-model_name: resnet50
-pretrained: false
-dataset_root: datasets/imagenet
 task: classification
-input_shape: [1, 3, 224, 224]
 
-sparsity:
-  mode: sparse_magnitude
-  sparsity: 0.5
+model:
+  name: resnet50
+  pretrained: false
+  input_shape: [1, 3, 224, 224]
 
-calibration:
-  num_samples: 32
-  batch_size: 1
-  split: train
+data:
+  root: datasets/imagenet
+  calibration:
+    split: train
+    num_samples: 32
+    batch_size: 1
+  evaluation:
+    split: val
 
-evaluation_split: val
+optimize:
+  sparsity:
+    mode: sparse_magnitude
+    sparsity: 0.5
 
 export:
   output_path: tmp/resnet50_imagenet.sparse.onnx

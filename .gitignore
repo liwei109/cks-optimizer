@@ -222,6 +222,7 @@ __marimo__/
 # project local outputs
 /tmp/
 tmp/
-/datasets/
+datasets
+datasets/
 models
 models/

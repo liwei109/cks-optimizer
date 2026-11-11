@@ -6,6 +6,7 @@ from cks_optimizer.cnn import (
     CalibrationConfig,
     OptimizeConfig,
     QuantConfig,
+    QuantizerSettings,
     SparsityConfig,
     build_optimize_config,
 )
@@ -63,6 +64,68 @@ def test_build_optimize_config_resolves_quant_preset_and_extra():
     )
     assert cfg._quant_cfg
     assert cfg._quant_cfg["custom_option"] is True
+
+
+def test_quantizer_settings_map_to_modelopt_attributes():
+    import modelopt.torch.quantization as mtq
+
+    cfg = build_optimize_config(
+        {
+            "model_name": "resnet50",
+            "quant": {
+                "mode": "int8",
+                "weights": {
+                    "bits": 6,
+                    "scheme": "symmetric",
+                    "granularity": "per_group",
+                    "group_size": 32,
+                },
+                "activations": {
+                    "bits": 8,
+                    "scheme": "symmetric",
+                    "granularity": "per_channel",
+                },
+            },
+        }
+    )
+    weight_cfg = next(
+        entry["cfg"]
+        for entry in cfg._quant_cfg["quant_cfg"]
+        if entry.get("quantizer_name") == "*weight_quantizer"
+    )
+    activation_cfg = next(
+        entry["cfg"]
+        for entry in cfg._quant_cfg["quant_cfg"]
+        if entry.get("quantizer_name") == "*input_quantizer"
+    )
+
+    assert weight_cfg["num_bits"] == 6
+    assert weight_cfg["block_sizes"] == {-1: 32}
+    assert weight_cfg["unsigned"] is False
+    assert weight_cfg["narrow_range"] is False
+    assert activation_cfg["num_bits"] == 8
+    assert activation_cfg["axis"] == 1
+    mtq.QuantizeConfig(**cfg._quant_cfg)
+
+
+def test_quantizer_settings_reject_asymmetric_scheme():
+    with pytest.raises(ValueError, match="supports symmetric integer quantization only"):
+        QuantizerSettings(scheme="asymmetric")
+
+
+@pytest.mark.parametrize(
+    ("settings", "message"),
+    [
+        ({"granularity": "per_group"}, "group_size is required"),
+        (
+            {"granularity": "per_tensor", "group_size": 32},
+            "group_size is only valid",
+        ),
+    ],
+)
+def test_quantizer_settings_validate_granularity_options(settings, message):
+    with pytest.raises(ValueError, match=message):
+        QuantizerSettings(**settings)
 
 
 def test_build_optimize_config_rejects_unavailable_quant_preset():

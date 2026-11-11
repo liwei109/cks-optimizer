@@ -118,6 +118,12 @@ def test_cli_explicit_flags_override_yaml_config(tmp_path, monkeypatch, capsys):
             "--config",
             str(config_path),
             "--no-pretrained",
+            "--calibration-split",
+            "val2017",
+            "--evaluation-split",
+            "val2017",
+            "--evaluation-batch-size",
+            "8",
             "--output",
             str(tmp_path / "cli.onnx"),
             "--json",
@@ -126,6 +132,9 @@ def test_cli_explicit_flags_override_yaml_config(tmp_path, monkeypatch, capsys):
 
     assert code == 0
     assert captured["config"].pretrained is False
+    assert captured["config"].calibration.split == "val2017"
+    assert captured["config"].evaluation_split == "val2017"
+    assert captured["config"].evaluation_batch_size == 8
     assert captured["config"].output_path == str(tmp_path / "cli.onnx")
     payload = json.loads(capsys.readouterr().out)
     assert payload["output"] == str(tmp_path / "cli.onnx")
@@ -147,6 +156,50 @@ def test_cli_unspecified_boolean_keeps_yaml_value(tmp_path, monkeypatch):
 
     assert cli.main(["cnn", "--config", str(config_path)]) == 0
     assert captured["pretrained"] is True
+
+
+def test_cli_evaluation_only_defaults_named_model_to_pretrained(monkeypatch, capsys):
+    from cks_optimizer import cli
+
+    captured = {}
+
+    def fake_run_cnn_pipeline(**kwargs):
+        captured["config"] = kwargs["config"]
+        return _fake_result(kwargs["config"], TinyModel().eval())
+
+    monkeypatch.setattr(cli, "run_cnn_pipeline", fake_run_cnn_pipeline)
+
+    assert cli.main(["cnn", "--model", "resnet50", "--dataset", "datasets/imagenet"]) == 0
+
+    assert captured["config"].effective_algorithms == []
+    assert captured["config"].pretrained is True
+    capsys.readouterr()
+
+
+def test_cli_evaluation_only_respects_no_pretrained(monkeypatch, capsys):
+    from cks_optimizer import cli
+
+    captured = {}
+
+    def fake_run_cnn_pipeline(**kwargs):
+        captured["config"] = kwargs["config"]
+        return _fake_result(kwargs["config"], TinyModel().eval())
+
+    monkeypatch.setattr(cli, "run_cnn_pipeline", fake_run_cnn_pipeline)
+
+    assert cli.main(
+        [
+            "cnn",
+            "--model",
+            "resnet50",
+            "--dataset",
+            "datasets/imagenet",
+            "--no-pretrained",
+        ]
+    ) == 0
+
+    assert captured["config"].pretrained is False
+    capsys.readouterr()
 
 
 def test_cli_rejects_invalid_lm_model_name():

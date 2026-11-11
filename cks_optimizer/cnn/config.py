@@ -88,6 +88,75 @@ _LEGACY_FLAT_KEYS: dict[str, tuple[str, str]] = {
 _IGNORED_KEYS = frozenset({"algorithms"})
 
 
+def _normalize_grouped_config(data: dict[str, Any]) -> dict[str, Any]:
+    """Translate grouped recipe sections into the internal flat config schema."""
+    groups = {
+        name: data.pop(name)
+        for name in ("model", "data", "optimize")
+        if name in data
+    }
+
+    def require_mapping(section_name: str, value: Any) -> Mapping[str, Any]:
+        if not isinstance(value, Mapping):
+            raise ValueError(f"Config section {section_name!r} must be a mapping")
+        return value
+
+    def assign(key: str, value: Any) -> None:
+        if key in data:
+            raise ValueError(
+                f"Config value {key!r} is specified both inside a grouped section "
+                "and at the top level."
+            )
+        data[key] = copy.deepcopy(value)
+
+    model = require_mapping("model", groups.get("model", {}))
+    for key, value in model.items():
+        target = {"name": "model_name"}.get(key, key)
+        if target not in {"model_name", "pretrained", "input_shape"}:
+            raise ValueError(f"Unknown model config key {key!r}")
+        assign(target, value)
+
+    data_group = require_mapping("data", groups.get("data", {}))
+    unknown_data_keys = set(data_group) - {
+        "root",
+        "dataset_root",
+        "calibration",
+        "evaluation",
+        "evaluation_split",
+    }
+    if unknown_data_keys:
+        raise ValueError(f"Unknown data config key(s): {sorted(unknown_data_keys)}")
+    for key in ("root", "dataset_root"):
+        if key in data_group:
+            assign("dataset_root", data_group[key])
+    if "calibration" in data_group:
+        assign("calibration", data_group["calibration"])
+    if "evaluation" in data_group:
+        evaluation = require_mapping("data.evaluation", data_group["evaluation"])
+        if set(evaluation) - {"split", "batch_size"}:
+            raise ValueError(
+                "data.evaluation only accepts the 'split' and 'batch_size' keys"
+            )
+        if "split" in evaluation:
+            assign("evaluation_split", evaluation["split"])
+        if "batch_size" in evaluation:
+            assign("evaluation_batch_size", evaluation["batch_size"])
+    if "evaluation_split" in data_group:
+        assign("evaluation_split", data_group["evaluation_split"])
+
+    optimize = require_mapping("optimize", groups.get("optimize", {}))
+    for key, value in optimize.items():
+        target = {"quantization": "quant"}.get(key, key)
+        if target not in {"quant", "sparsity"}:
+            raise ValueError(
+                f"Unknown optimize config key {key!r}; expected 'quantization' "
+                "and/or 'sparsity'."
+            )
+        assign(target, value)
+
+    return data
+
+
 # Inference
 
 
@@ -214,15 +283,72 @@ def _validate_input_shape(shape: Any) -> tuple[int, ...]:
 
 
 @dataclass
+class QuantizerSettings:
+    """INT8 quantizer settings mapped to ModelOpt quantizer attributes."""
+
+    bits: int = 8
+    scheme: str = "symmetric"
+    granularity: str = "per_tensor"
+    group_size: int | None = None
+    axis: int | None = None
+
+    def __post_init__(self) -> None:
+        self.bits = int(self.bits)
+        if self.bits < 1:
+            raise ValueError(f"quantizer bits must be >= 1, got {self.bits}")
+
+        self.scheme = str(self.scheme).strip().lower().replace("-", "_")
+        if self.scheme != "symmetric":
+            raise ValueError(
+                f"Unsupported quantization scheme {self.scheme!r}; the ModelOpt "
+                "PyTorch backend supports symmetric integer quantization only."
+            )
+
+        self.granularity = str(self.granularity).strip().lower().replace("-", "_")
+        if self.granularity not in {"per_tensor", "per_channel", "per_group"}:
+            raise ValueError(
+                f"Unsupported quantization granularity {self.granularity!r}; "
+                "expected per_tensor, per_channel, or per_group."
+            )
+
+        if self.group_size is not None:
+            self.group_size = int(self.group_size)
+            if self.group_size < 1:
+                raise ValueError(
+                    f"quantizer group_size must be >= 1, got {self.group_size}"
+                )
+
+        if self.granularity == "per_group":
+            if self.group_size is None:
+                raise ValueError("group_size is required for per_group quantization")
+            if self.axis is not None:
+                raise ValueError("axis cannot be set for per_group quantization")
+        elif self.group_size is not None:
+            raise ValueError("group_size is only valid for per_group quantization")
+
+        if self.granularity == "per_tensor" and self.axis is not None:
+            raise ValueError("axis cannot be set for per_tensor quantization")
+
+
+@dataclass
 class QuantConfig:
     """Quantization settings (ModelOpt)."""
 
     mode: str = "int8"
     preset: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    weights: QuantizerSettings | Mapping[str, Any] | None = None
+    activations: QuantizerSettings | Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.mode = _normalize_quant_mode(self.mode)
+        for name in ("weights", "activations"):
+            settings = getattr(self, name)
+            if isinstance(settings, Mapping):
+                settings = QuantizerSettings(**settings)
+                setattr(self, name, settings)
+            elif settings is not None and not isinstance(settings, QuantizerSettings):
+                raise ValueError(f"quantization.{name} must be a mapping")
 
 
 @dataclass
@@ -291,6 +417,7 @@ class OptimizeConfig:
     task: str = ""
     input_shape: tuple[int, ...] | None = None
     evaluation_split: str = "val"
+    evaluation_batch_size: int = 16
     pretrained: bool = False
     device: str = ""
     quant: QuantConfig | None = None
@@ -312,6 +439,12 @@ class OptimizeConfig:
             dataset = infer_dataset_from_root(self.dataset_root or ".")
             self.task = infer_task_from_model_and_dataset(self.model_name, dataset)
         self.evaluation_split = str(self.evaluation_split).strip() or "val"
+        self.evaluation_batch_size = int(self.evaluation_batch_size)
+        if self.evaluation_batch_size < 1:
+            raise ValueError(
+                "evaluation_batch_size must be >= 1, "
+                f"got {self.evaluation_batch_size}"
+            )
         if not self.export.output_path and not self._output_path_explicit:
             self.export.output_path = build_default_output_path(
                 self.model_name, self.quant.mode if self.quant else ""
@@ -525,6 +658,7 @@ def build_optimize_config(
         ImportError: If quantization is configured but ModelOpt is unavailable.
     """
     data = _coerce_to_mapping(source) if source is not None else {}
+    data = _normalize_grouped_config(data)
     _merge_overrides(data, overrides)
 
     # Pull out the nested sections; unknown top-level keys go to ``extra``.
@@ -596,6 +730,52 @@ def _build_modelopt_quant_cfg(quant: QuantConfig) -> dict[str, Any]:
             "the installed modelopt version."
         )
     quant_cfg = copy.deepcopy(preset)
+    if quant.weights is not None or quant.activations is not None:
+        if quant.mode != "int8":
+            raise ValueError(
+                "quantization.weights and quantization.activations are currently "
+                "supported only with mode 'int8'."
+            )
+        entries = quant_cfg.get("quant_cfg")
+        if not isinstance(entries, list):
+            raise ValueError("ModelOpt quant preset must define a quant_cfg list")
+        for name, settings, default_axis in (
+            ("weight_quantizer", quant.weights, 0),
+            ("input_quantizer", quant.activations, 1),
+        ):
+            if settings is None:
+                continue
+            attributes: dict[str, Any] = {
+                "num_bits": settings.bits,
+                "unsigned": False,
+                "narrow_range": False,
+            }
+            if settings.granularity == "per_tensor":
+                attributes["axis"] = None
+            elif settings.granularity == "per_channel":
+                attributes["axis"] = (
+                    settings.axis if settings.axis is not None else default_axis
+                )
+            else:
+                attributes["block_sizes"] = {-1: settings.group_size}
+
+            matching_entries = [
+                entry
+                for entry in entries
+                if entry.get("quantizer_name") == f"*{name}"
+            ]
+            if not matching_entries:
+                raise ValueError(
+                    f"ModelOpt quant preset '{preset_name}' does not configure "
+                    f"{name}."
+                )
+            for entry in matching_entries:
+                quantizer_attributes = entry.setdefault("cfg", {})
+                if "block_sizes" in attributes:
+                    quantizer_attributes.pop("axis", None)
+                else:
+                    quantizer_attributes.pop("block_sizes", None)
+                quantizer_attributes.update(attributes)
     quant_cfg.update(quant.extra)
     return quant_cfg
 

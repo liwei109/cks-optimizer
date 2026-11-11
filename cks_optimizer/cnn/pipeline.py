@@ -63,38 +63,48 @@ def run_cnn_pipeline(
     """
     # Normalize the config and apply explicit overrides.
     cfg = build_optimize_config(config, **overrides)
-    if not cfg.effective_algorithms:
+    if not cfg.effective_algorithms and not evaluate_model:
         raise ValueError(
-            "No optimization algorithm configured. Add a 'quant' and/or "
-            "'sparsity' section to the config."
+            "No quantization or sparsity algorithm is configured, and evaluation "
+            "is disabled. Enable evaluation or configure an optimization algorithm."
         )
 
     # Load onnx or pytorch model.
+    model_source = model if model is not None else cfg.model_name
     model = load_cnn_model(
-        model if model is not None else cfg.model_name,
+        model_source,
         pretrained=cfg.pretrained,
         device=cfg.device or None,
     )
 
-    # Prepare calibration data and sample input.
+    # Evaluation-only runs need the validation set, but not a calibration split.
     data, sample_input = data_process(
         cfg,
         model=model,
         include_evaluation=evaluate_model and cfg.evaluation_supported,
+        include_calibration=bool(cfg.effective_algorithms),
     )
 
-    # Sparsify and quantize the model.
-    optimized_model = optimize_cnn_model(
-        model,
-        sample_input,
-        config=cfg,
-        calib_data=data.calib_data,
-    )
+    if cfg.effective_algorithms:
+        optimized_model = optimize_cnn_model(
+            model,
+            sample_input,
+            config=cfg,
+            calib_data=data.calib_data,
+        )
+        optimized_onnx_path = export_onnx(
+            optimized_model, sample_input, config=cfg
+        )
+    else:
+        optimized_model = model
+        source_path = Path(model_source) if isinstance(model_source, (str, Path)) else None
+        if source_path is not None and source_path.suffix.lower() == ".onnx":
+            optimized_onnx_path = source_path
+        else:
+            optimized_onnx_path = export_onnx(
+                model, sample_input, config=cfg
+            )
 
-    # Export the optimized model.
-    optimized_onnx_path = export_onnx(optimized_model, sample_input, config=cfg)
-
-    # Measure metrics and analyze the optimized error.
     evaluation = evaluate(
         optimized_onnx_path,
         data.evaluation_dataset,
@@ -102,6 +112,7 @@ def run_cnn_pipeline(
         config=cfg,
         enabled=evaluate_model,
         input_name=cfg.export.input_names[0],
+        batch_size=cfg.evaluation_batch_size,
         providers=providers,
     )
 

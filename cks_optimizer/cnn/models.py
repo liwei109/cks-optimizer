@@ -126,9 +126,14 @@ def _load_torchvision_model(model_name: str, *, pretrained: bool = False) -> tor
 
     weights: Any = None
     if pretrained:
-        # Prefer the official weights enum; fall back to the legacy
-        # ``pretrained=`` flag for factories that predate it.
-        weights_enum = getattr(model_factory, "Weights", None)
+        # Resolve the official weights enum both for the model factory and
+        # its preprocessing metadata.
+        get_model_weights = getattr(torchvision_models, "get_model_weights", None)
+        weights_enum = (
+            get_model_weights(model_factory)
+            if get_model_weights is not None
+            else getattr(model_factory, "Weights", None)
+        )
         weights = weights_enum.DEFAULT if weights_enum is not None else "DEFAULT"
     model_kwargs: dict[str, Any] = {"weights": weights}
     if not pretrained and "weights_backbone" in inspect.signature(model_factory).parameters:
@@ -139,6 +144,9 @@ def _load_torchvision_model(model_name: str, *, pretrained: bool = False) -> tor
         model = model_factory(pretrained=pretrained)
     if not isinstance(model, torch.nn.Module):
         raise TypeError(f"Resolved torchvision model '{resolved}' is not a nn.Module.")
+    weight_transforms = getattr(weights, "transforms", None)
+    if pretrained and callable(weight_transforms):
+        model._cks_image_transform = weight_transforms()
     return model.eval()
 
 
@@ -244,6 +252,69 @@ def _onnx_declared_input_shape(source: Any) -> tuple[int, ...] | None:
     return None
 
 
+def _onnx_has_yolov5_raw_output(source: Any) -> bool:
+    """Whether an ONNX graph exposes the standard YOLOv5 COCO raw tensor."""
+    try:
+        import onnx
+
+        model = onnx.load(source, load_external_data=False) if isinstance(source, str) else source
+    except Exception as exc:  # pragma: no cover - malformed file
+        logger.debug("Cannot inspect detection outputs: %s", exc)
+        return False
+
+    return any(
+        len(output.type.tensor_type.shape.dim) == 3
+        and output.type.tensor_type.shape.dim[-1].HasField("dim_value")
+        and output.type.tensor_type.shape.dim[-1].dim_value == 85
+        for output in model.graph.output
+    )
+
+
+def _make_yolov5_batch_dynamic(model: Any) -> bool:
+    """Make static batch-one YOLOv5 Reshape nodes work with dynamic batches."""
+    import onnx
+    from onnx import numpy_helper
+
+    shape_tensors = {
+        initializer.name: initializer for initializer in model.graph.initializer
+    }
+    constant_tensors = {}
+    for node in model.graph.node:
+        if node.op_type == "Constant":
+            tensor = next(
+                (attribute.t for attribute in node.attribute if attribute.name == "value"),
+                None,
+            )
+            if tensor is not None:
+                constant_tensors[node.output[0]] = tensor
+
+    patched_shapes = 0
+    for node in model.graph.node:
+        if node.op_type != "Reshape" or len(node.input) < 2:
+            continue
+        tensor = shape_tensors.get(node.input[1]) or constant_tensors.get(node.input[1])
+        if tensor is None:
+            continue
+        shape = numpy_helper.to_array(tensor)
+        if shape.ndim != 1 or not shape.size or int(shape[0]) != 1:
+            continue
+        shape = shape.copy()
+        shape[0] = 0
+        tensor.CopyFrom(numpy_helper.from_array(shape, name=tensor.name))
+        patched_shapes += 1
+
+    if not patched_shapes:
+        return False
+
+    for value_info in (*model.graph.input, *model.graph.output):
+        if value_info.name in shape_tensors or not value_info.type.tensor_type.shape.dim:
+            continue
+        batch_dimension = value_info.type.tensor_type.shape.dim[0]
+        batch_dimension.ClearField("dim_value")
+        batch_dimension.dim_param = "batch_size"
+    return True
+
+
 def _patch_onnx2torch_opset_version() -> None:
     """Keep ``onnx2torch`` working on torch versions that removed the opset global.
 
@@ -283,10 +354,28 @@ def _load_local_onnx_model(model_path: str | Path) -> torch.nn.Module:
     # because onnx2torch's own shape inference does not resolve external files.
     source: str | Any = str(path)
     declared_shape = _onnx_declared_input_shape(str(path))
+    has_yolov5_raw_output = _onnx_has_yolov5_raw_output(str(path))
+    max_batch_size = None
     if _has_external_data(path):
         import onnx
 
         source = onnx.load(str(path), load_external_data=True)
+        has_yolov5_raw_output = _onnx_has_yolov5_raw_output(source)
+
+    if has_yolov5_raw_output and declared_shape and declared_shape[0] == 1:
+        if isinstance(source, str):
+            import onnx
+
+            source = onnx.load(source, load_external_data=True)
+        if _make_yolov5_batch_dynamic(source):
+            logger.info("Enabled dynamic batch support for YOLOv5 ONNX model %s.", path)
+        else:
+            max_batch_size = 1
+            logger.warning(
+                "YOLOv5 ONNX model %s has a fixed batch size and could not be "
+                "converted to dynamic batch; using batch size 1.",
+                path,
+            )
 
     _patch_onnx2torch_opset_version()
     onnx_model = convert(source)
@@ -296,6 +385,8 @@ def _load_local_onnx_model(model_path: str | Path) -> torch.nn.Module:
         # Read back by infer_model_input_shape(); nn.Module.__setattr__
         # stores plain values normally, only Parameters/Modules are special.
         onnx_model._cks_onnx_input_shape = declared_shape  # type: ignore[assignment]
+    onnx_model._cks_yolov5_raw_output = has_yolov5_raw_output  # type: ignore[attr-defined]
+    onnx_model._cks_max_batch_size = max_batch_size  # type: ignore[attr-defined]
     return onnx_model.eval()
 
 
