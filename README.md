@@ -18,7 +18,7 @@ Clone the repository with its submodules, then install the project and backends 
 ```bash
 git clone --recurse-submodules https://github.com/liwei109/cks-optimizer.git
 cd cks-optimizer
-python -m pip install -e ".[coco]" \
+python -m pip install -e . \
   -e thirdparty/Model-Optimizer \
   -e thirdparty/llm-compressor \
   -e thirdparty/onnx2torch
@@ -31,8 +31,11 @@ Use Python 3.11 or newer.
 Run quantization with CLI options:
 
 ```bash
-cks-opt cnn --model resnet50 --dataset datasets/imagenet --quant-mode int8
+cks-opt cnn --model resnet50 --dataset datasets/imagenet --quant-mode int8 --pretrained
 ```
+
+Without `--quant-mode`, `--sparsity`, or an optimization section in `--config`,
+the CNN command evaluates the input model without quantizing or sparsifying it.
 
 Or run a recipe from [`recipes/cnn/base_cls.yaml`](recipes/cnn/base_cls.yaml):
 
@@ -40,7 +43,8 @@ Or run a recipe from [`recipes/cnn/base_cls.yaml`](recipes/cnn/base_cls.yaml):
 cks-opt cnn --config recipes/cnn/base_cls.yaml
 ```
 
-Run large-model optimization with CLI options, using the recipe from [`recipes/lm/base_int8.yaml`](recipes/lm/base_int8.yaml):
+Run large-model optimization with CLI options, using the
+recipe from [`recipes/lm/base_int8.yaml`](recipes/lm/base_int8.yaml):
 
 ```bash
 cks-opt lm --model Qwen/Qwen2.5-0.5B-Instruct \

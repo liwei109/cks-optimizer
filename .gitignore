@@ -71,6 +71,7 @@ instance/
 
 # Sphinx documentation
 docs/_build/
+docs/api/generated/
 
 # PyBuilder
 .pybuilder/
@@ -222,6 +223,9 @@ __marimo__/
 # project local outputs
 /tmp/
 tmp/
-/datasets/
+datasets
+datasets/
 models
 models/
+!cks_optimizer/cnn/datasets/
+!cks_optimizer/cnn/datasets/*.py

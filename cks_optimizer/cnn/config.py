@@ -56,8 +56,7 @@ QUANT_MODES: dict[str, str] = {
 # that does not require a calibration dataloader.
 SPARSITY_MODES: frozenset[str] = frozenset({"sparse_magnitude", "sparsegpt"})
 
-# Modes whose exported ONNX graph contains TensorRT-only custom ops, which
-# onnxruntime cannot load; accuracy evaluation is skipped for these.
+# TensorRT-only quantization modes that are not supported by this evaluation path.
 TRT_ONLY_QUANT_MODES: frozenset[str] = frozenset({"fp8", "nvfp4", "nvfp4_svdquant"})
 
 # Nested section names accepted by ``build_optimize_config``.
@@ -88,6 +87,77 @@ _LEGACY_FLAT_KEYS: dict[str, tuple[str, str]] = {
 _IGNORED_KEYS = frozenset({"algorithms"})
 
 
+def _require_mapping(section_name: str, value: Any) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"Config section {section_name!r} must be a mapping")
+    return value
+
+
+def _assign_grouped_value(data: dict[str, Any], key: str, value: Any) -> None:
+    if key in data:
+        raise ValueError(
+            f"Config value {key!r} is specified both inside a grouped section "
+            "and at the top level."
+        )
+    data[key] = copy.deepcopy(value)
+
+
+def _normalize_grouped_config(data: dict[str, Any]) -> dict[str, Any]:
+    """Translate grouped recipe sections into the internal flat config schema."""
+    groups = {
+        name: data.pop(name) for name in ("model", "data", "optimize") if name in data
+    }
+
+    model = _require_mapping("model", groups.get("model", {}))
+    for key, value in model.items():
+        target = {"name": "model_name"}.get(key, key)
+        if target not in {"model_name", "pretrained", "input_shape"}:
+            raise ValueError(f"Unknown model config key {key!r}")
+        _assign_grouped_value(data, target, value)
+
+    data_group = _require_mapping("data", groups.get("data", {}))
+    unknown_data_keys = set(data_group) - {
+        "root",
+        "dataset_root",
+        "calibration",
+        "evaluation",
+        "evaluation_split",
+    }
+    if unknown_data_keys:
+        raise ValueError(f"Unknown data config key(s): {sorted(unknown_data_keys)}")
+    for key in ("root", "dataset_root"):
+        if key in data_group:
+            _assign_grouped_value(data, "dataset_root", data_group[key])
+    if "calibration" in data_group:
+        _assign_grouped_value(data, "calibration", data_group["calibration"])
+    if "evaluation" in data_group:
+        evaluation = _require_mapping("data.evaluation", data_group["evaluation"])
+        if set(evaluation) - {"split", "batch_size"}:
+            raise ValueError(
+                "data.evaluation only accepts the 'split' and 'batch_size' keys"
+            )
+        if "split" in evaluation:
+            _assign_grouped_value(data, "evaluation_split", evaluation["split"])
+        if "batch_size" in evaluation:
+            _assign_grouped_value(
+                data, "evaluation_batch_size", evaluation["batch_size"]
+            )
+    if "evaluation_split" in data_group:
+        _assign_grouped_value(data, "evaluation_split", data_group["evaluation_split"])
+
+    optimize = _require_mapping("optimize", groups.get("optimize", {}))
+    for key, value in optimize.items():
+        target = {"quantization": "quant"}.get(key, key)
+        if target not in {"quant", "sparsity"}:
+            raise ValueError(
+                f"Unknown optimize config key {key!r}; expected 'quantization' "
+                "and/or 'sparsity'."
+            )
+        _assign_grouped_value(data, target, value)
+
+    return data
+
+
 # Inference
 
 
@@ -116,11 +186,14 @@ def infer_dataset_from_root(dataset_root: str | Path | None) -> str:
     child_dirs = sorted(path for path in root.iterdir() if path.is_dir())
     search_dirs.extend(child_dirs)
     search_dirs.extend(
-        annotations for child in child_dirs if (annotations := child / "annotations").is_dir()
+        annotations
+        for child in child_dirs
+        if (annotations := child / "annotations").is_dir()
     )
 
     if any(
-        (directory / "JPEGImages").is_dir() and (directory / "SegmentationClass").is_dir()
+        (directory / "JPEGImages").is_dir()
+        and (directory / "SegmentationClass").is_dir()
         for directory in search_dirs
     ):
         return "voc"
@@ -204,7 +277,9 @@ def _validate_input_shape(shape: Any) -> tuple[int, ...]:
         raise ValueError("input_shape must be a 4-element sequence (NCHW)")
     validated = tuple(int(dim) for dim in shape)
     if len(validated) != 4:
-        raise ValueError(f"input_shape must have exactly 4 dimensions (NCHW), got {validated}")
+        raise ValueError(
+            f"input_shape must have exactly 4 dimensions (NCHW), got {validated}"
+        )
     if any(dim < 1 for dim in validated):
         raise ValueError(f"input_shape dimensions must be positive, got {validated}")
     return validated
@@ -214,20 +289,101 @@ def _validate_input_shape(shape: Any) -> tuple[int, ...]:
 
 
 @dataclass
+class QuantizerSettings:
+    """INT8 quantizer settings mapped to ModelOpt quantizer attributes.
+
+    Args:
+        bits: Integer precision in bits; must be positive.
+        scheme: Quantization scheme. The supported PyTorch backend setting is
+            ``"symmetric"``.
+        granularity: ``"per_tensor"``, ``"per_channel"``, or ``"per_group"``.
+        group_size: Positive group size required for ``per_group`` quantization.
+        axis: Tensor axis for per-channel quantization when overriding defaults.
+    """
+
+    bits: int = 8
+    scheme: str = "symmetric"
+    granularity: str = "per_tensor"
+    group_size: int | None = None
+    axis: int | None = None
+
+    def __post_init__(self) -> None:
+        self.bits = int(self.bits)
+        if self.bits < 1:
+            raise ValueError(f"quantizer bits must be >= 1, got {self.bits}")
+
+        self.scheme = str(self.scheme).strip().lower().replace("-", "_")
+        if self.scheme != "symmetric":
+            raise ValueError(
+                f"Unsupported quantization scheme {self.scheme!r}; the ModelOpt "
+                "PyTorch backend supports symmetric integer quantization only."
+            )
+
+        self.granularity = str(self.granularity).strip().lower().replace("-", "_")
+        if self.granularity not in {"per_tensor", "per_channel", "per_group"}:
+            raise ValueError(
+                f"Unsupported quantization granularity {self.granularity!r}; "
+                "expected per_tensor, per_channel, or per_group."
+            )
+
+        if self.group_size is not None:
+            self.group_size = int(self.group_size)
+            if self.group_size < 1:
+                raise ValueError(
+                    f"quantizer group_size must be >= 1, got {self.group_size}"
+                )
+
+        if self.granularity == "per_group":
+            if self.group_size is None:
+                raise ValueError("group_size is required for per_group quantization")
+            if self.axis is not None:
+                raise ValueError("axis cannot be set for per_group quantization")
+        elif self.group_size is not None:
+            raise ValueError("group_size is only valid for per_group quantization")
+
+        if self.granularity == "per_tensor" and self.axis is not None:
+            raise ValueError("axis cannot be set for per_tensor quantization")
+
+
+@dataclass
 class QuantConfig:
-    """Quantization settings (ModelOpt)."""
+    """ModelOpt quantization settings.
+
+    Args:
+        mode: Supported quantization mode, such as ``"int8"``.
+        preset: Optional ModelOpt preset override.
+        extra: Additional ModelOpt quantizer configuration.
+        weights: Optional weight quantizer settings or a mapping of their fields.
+        activations: Optional activation quantizer settings or a field mapping.
+    """
 
     mode: str = "int8"
     preset: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    weights: QuantizerSettings | Mapping[str, Any] | None = None
+    activations: QuantizerSettings | Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.mode = _normalize_quant_mode(self.mode)
+        for name in ("weights", "activations"):
+            settings = getattr(self, name)
+            if isinstance(settings, Mapping):
+                settings = QuantizerSettings(**settings)
+                setattr(self, name, settings)
+            elif settings is not None and not isinstance(settings, QuantizerSettings):
+                raise ValueError(f"quantization.{name} must be a mapping")
 
 
 @dataclass
 class SparsityConfig:
-    """Sparsity settings (ModelOpt)."""
+    """ModelOpt sparsity settings.
+
+    Args:
+        mode: Sparsification algorithm, such as ``"sparse_magnitude"`` or
+            ``"sparsegpt"``.
+        sparsity: Requested sparsity ratio in the interval ``[0, 1)``.
+        extra: Additional settings forwarded to ModelOpt.
+    """
 
     mode: str = "sparse_magnitude"
     sparsity: float = 0.5
@@ -246,7 +402,17 @@ class SparsityConfig:
 
 @dataclass
 class ExportConfig:
-    """ONNX export settings."""
+    """ONNX export and validation settings.
+
+    Args:
+        output_path: Destination ONNX path.
+        opset_version: ONNX operator-set version (7 or newer).
+        use_dynamic_axes: Whether to mark the leading batch axis dynamic.
+        simplify: Whether to simplify the exported graph with onnxsim.
+        check_onnx: Whether to validate the exported graph.
+        input_names: ONNX input names.
+        output_names: ONNX output names.
+    """
 
     output_path: str = ""
     opset_version: int = 17
@@ -266,7 +432,14 @@ class ExportConfig:
 
 @dataclass
 class CalibrationConfig:
-    """Calibration settings used by ``data_process`` and quantization."""
+    """Calibration settings used by ``data_process`` and quantization.
+
+    Args:
+        num_samples: Maximum number of images sampled from the calibration split.
+        batch_size: Number of images per calibration batch.
+        split: Dataset split used for calibration.
+        extra: Additional calibration settings reserved for backend extensions.
+    """
 
     num_samples: int = 32
     batch_size: int = 1
@@ -276,21 +449,42 @@ class CalibrationConfig:
     def __post_init__(self) -> None:
         self.num_samples = int(self.num_samples)
         if self.num_samples < 1:
-            raise ValueError(f"calibration.num_samples must be >= 1, got {self.num_samples}")
+            raise ValueError(
+                f"calibration.num_samples must be >= 1, got {self.num_samples}"
+            )
         self.batch_size = int(self.batch_size)
         if self.batch_size < 1:
-            raise ValueError(f"calibration.batch_size must be >= 1, got {self.batch_size}")
+            raise ValueError(
+                f"calibration.batch_size must be >= 1, got {self.batch_size}"
+            )
 
 
 @dataclass
 class OptimizeConfig:
-    """Top-level configuration for the CNN optimization pipeline."""
+    """Top-level configuration for the CNN optimization pipeline.
+
+    Args:
+        model_name: Torchvision/timm model name or local ONNX path.
+        dataset_root: Root directory of the selected dataset.
+        task: Task name; inferred from the model and dataset when omitted.
+        input_shape: Optional NCHW input shape.
+        evaluation_split: Held-out split used for evaluation.
+        evaluation_batch_size: Batch size used for evaluation.
+        pretrained: Whether to load pretrained model weights.
+        device: Execution device. The pipeline defaults to CUDA when unset.
+        quant: Optional quantization settings.
+        sparsity: Optional sparsification settings.
+        export: ONNX export settings.
+        calibration: Calibration sample, batch, and split settings.
+        extra: Additional configuration values for extensions.
+    """
 
     model_name: str = "resnet"
     dataset_root: str = ""
     task: str = ""
     input_shape: tuple[int, ...] | None = None
     evaluation_split: str = "val"
+    evaluation_batch_size: int = 16
     pretrained: bool = False
     device: str = ""
     quant: QuantConfig | None = None
@@ -312,6 +506,11 @@ class OptimizeConfig:
             dataset = infer_dataset_from_root(self.dataset_root or ".")
             self.task = infer_task_from_model_and_dataset(self.model_name, dataset)
         self.evaluation_split = str(self.evaluation_split).strip() or "val"
+        self.evaluation_batch_size = int(self.evaluation_batch_size)
+        if self.evaluation_batch_size < 1:
+            raise ValueError(
+                f"evaluation_batch_size must be >= 1, got {self.evaluation_batch_size}"
+            )
         if not self.export.output_path and not self._output_path_explicit:
             self.export.output_path = build_default_output_path(
                 self.model_name, self.quant.mode if self.quant else ""
@@ -365,7 +564,7 @@ class OptimizeConfig:
 
     @property
     def evaluation_supported(self) -> bool:
-        """Whether ONNX Runtime supports the configured quantization mode."""
+        """Whether the configured quantization mode supports this evaluation pipeline."""
         return self.quant is None or self.quant.mode not in TRT_ONLY_QUANT_MODES
 
     def output_file(self) -> Path:
@@ -395,7 +594,9 @@ def _load_config_file(path: str | Path) -> dict[str, Any]:
             ) from exc
         data = yaml.safe_load(text)
     else:
-        raise ValueError(f"Unsupported config file extension {suffix!r}; use .json, .yaml or .yml")
+        raise ValueError(
+            f"Unsupported config file extension {suffix!r}; use .json, .yaml or .yml"
+        )
     if not isinstance(data, dict):
         raise ValueError(f"Config file {file_path} must contain a mapping")
     return data
@@ -446,7 +647,9 @@ def _coerce_to_mapping(source: Any) -> dict[str, Any]:
     )
 
 
-def _merge_overrides(base: MutableMapping[str, Any], overrides: Mapping[str, Any]) -> None:
+def _merge_overrides(
+    base: MutableMapping[str, Any], overrides: Mapping[str, Any]
+) -> None:
     """Merge flat/nested override kwargs into ``base`` in place.
 
     Nested dict overrides are merged key-by-key so that passing
@@ -518,6 +721,9 @@ def build_optimize_config(
     A *new* :class:`OptimizeConfig` is always returned, even when ``source`` is
     already one, so overrides can never be observed half-applied.
 
+    Returns:
+        A new, validated :class:`OptimizeConfig`.
+
     Raises:
         ValueError: If an unknown key is supplied, or a value fails validation
             (unknown quantization mode, malformed ``input_shape``, out-of-range
@@ -525,6 +731,7 @@ def build_optimize_config(
         ImportError: If quantization is configured but ModelOpt is unavailable.
     """
     data = _coerce_to_mapping(source) if source is not None else {}
+    data = _normalize_grouped_config(data)
     _merge_overrides(data, overrides)
 
     # Pull out the nested sections; unknown top-level keys go to ``extra``.
@@ -549,7 +756,9 @@ def build_optimize_config(
     # ``algorithms`` is derived from configured sections, not stored separately.
     data.pop("algorithms", None)
 
-    top_level_fields = {f.name for f in fields(OptimizeConfig) if not f.name.startswith("_")}
+    top_level_fields = {
+        f.name for f in fields(OptimizeConfig) if not f.name.startswith("_")
+    }
     unknown = sorted(set(data) - top_level_fields - _IGNORED_KEYS)
     if unknown:
         raise ValueError(
@@ -596,6 +805,49 @@ def _build_modelopt_quant_cfg(quant: QuantConfig) -> dict[str, Any]:
             "the installed modelopt version."
         )
     quant_cfg = copy.deepcopy(preset)
+    if quant.weights is not None or quant.activations is not None:
+        if quant.mode != "int8":
+            raise ValueError(
+                "quantization.weights and quantization.activations are currently "
+                "supported only with mode 'int8'."
+            )
+        entries = quant_cfg.get("quant_cfg")
+        if not isinstance(entries, list):
+            raise ValueError("ModelOpt quant preset must define a quant_cfg list")
+        for name, settings, default_axis in (
+            ("weight_quantizer", quant.weights, 0),
+            ("input_quantizer", quant.activations, 1),
+        ):
+            if settings is None:
+                continue
+            attributes: dict[str, Any] = {
+                "num_bits": settings.bits,
+                "unsigned": False,
+                "narrow_range": False,
+            }
+            if settings.granularity == "per_tensor":
+                attributes["axis"] = None
+            elif settings.granularity == "per_channel":
+                attributes["axis"] = (
+                    settings.axis if settings.axis is not None else default_axis
+                )
+            else:
+                attributes["block_sizes"] = {-1: settings.group_size}
+
+            matching_entries = [
+                entry for entry in entries if entry.get("quantizer_name") == f"*{name}"
+            ]
+            if not matching_entries:
+                raise ValueError(
+                    f"ModelOpt quant preset '{preset_name}' does not configure {name}."
+                )
+            for entry in matching_entries:
+                quantizer_attributes = entry.setdefault("cfg", {})
+                if "block_sizes" in attributes:
+                    quantizer_attributes.pop("axis", None)
+                else:
+                    quantizer_attributes.pop("block_sizes", None)
+                quantizer_attributes.update(attributes)
     quant_cfg.update(quant.extra)
     return quant_cfg
 
@@ -634,7 +886,9 @@ class CNNConfig:
             dataset = infer_dataset_from_root(self.dataset_root or ".")
             self.task = infer_task_from_model_and_dataset(self.model_name, dataset)
         if not self.output_path:
-            self.output_path = build_default_output_path(self.model_name, self.quant_mode)
+            self.output_path = build_default_output_path(
+                self.model_name, self.quant_mode
+            )
 
     def to_optimize_config(self) -> OptimizeConfig:
         """Convert this legacy config into an :class:`OptimizeConfig`."""

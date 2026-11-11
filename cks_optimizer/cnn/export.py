@@ -57,6 +57,14 @@ def _simplify_onnx_model(
 
 
 def ensure_parent_dir(path: str | Path) -> Path:
+    """Create a file path's parent directories and return the path.
+
+    Args:
+        path: File path whose parent directory should exist.
+
+    Returns:
+        The same path represented as a :class:`~pathlib.Path`.
+    """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
@@ -68,7 +76,24 @@ def export_onnx(
     config: Any = None,
     **kwargs: Any,
 ) -> Path:
-    """Export a PyTorch model to ONNX using the configured export settings."""
+    """Export a PyTorch model to ONNX using configured export settings.
+
+    Args:
+        model: Model to export. It is switched to evaluation mode.
+        sample_input: Example input passed to ``torch.onnx.export``.
+        config: ``OptimizeConfig``, legacy ``CNNConfig``, or ``None`` for
+            default export settings.
+        **kwargs: Additional keyword arguments forwarded to
+            :func:`torch.onnx.export`, overriding matching defaults.
+
+    Returns:
+        The output ONNX file path.
+
+    Raises:
+        TypeError: If ``config`` is not a supported configuration type.
+        RuntimeError: If PyTorch fails to export the model.
+        ValueError: If ONNX validation or simplification fails.
+    """
     from cks_optimizer.cnn.config import CNNConfig, OptimizeConfig
 
     if config is None:

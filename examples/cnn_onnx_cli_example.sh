@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate cks-opt
+cd "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
-python -m cks_optimizer cnn \
-  --model tmp/resnet50.onnx \
-  --dataset ./datasets/imagenet \
-  --quant-mode int8
+cks-opt cnn \
+  --model models/yolov5s.onnx \
+  --dataset ./datasets/coco \
+  --quant-mode int8 \
+  --calibration-split val2017 \
+  --evaluation-split val2017

@@ -9,19 +9,23 @@ from .config import (
     ExportConfig,
     OptimizeConfig,
     QuantConfig,
+    QuantizerSettings,
     SparsityConfig,
     build_optimize_config,
 )
-from .datasets import ProcessedData, data_process
+from .datasets import (
+    CocoDataloader,
+    ImagenetDataloader,
+    ProcessedData,
+    VocDataloader,
+    data_process,
+)
 from .datasets.registry import normalize_dataset
 from .evaluate import EvaluationResult, evaluate
 from .export import export_onnx
 from .models import (
-    infer_model_input_shape,
+    CNNModelMetadata,
     load_cnn_model,
-    load_model,
-    resolve_cnn_model,
-    resolve_cnn_model_and_sample_input,
 )
 from .optimizer import (
     CNNOptimizer,
@@ -33,26 +37,27 @@ __all__ = [
     "CNNConfig",
     "CalibrationConfig",
     "CNNOptimizer",
+    "CNNModelMetadata",
+    "CocoDataloader",
     "EvaluationResult",
     "ExportConfig",
     "OptimizeConfig",
     "OptimizationResult",
+    "ImagenetDataloader",
     "ProcessedData",
     "QUANT_MODES",
     "QuantConfig",
+    "QuantizerSettings",
     "SPARSITY_MODES",
     "SparsityConfig",
     "TRT_ONLY_QUANT_MODES",
+    "VocDataloader",
     "build_optimize_config",
     "data_process",
     "evaluate",
     "export_onnx",
-    "infer_model_input_shape",
     "load_cnn_model",
-    "load_model",
     "normalize_dataset",
     "optimize_cnn_model",
-    "resolve_cnn_model",
-    "resolve_cnn_model_and_sample_input",
     "run_cnn_pipeline",
 ]
