@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate cks-opt
+cd "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
-mkdir -p tmp
-
-python -m cks_optimizer cnn \
+cks-opt cnn \
   --model resnet50 \
-  --dataset ./tmp \
-  --quant-mode int8
+  --dataset ./datasets/imagenet \
+  --quant-mode int8 \
+  --pretrained \
+  --num-samples 128 \
+  --batch-size 8

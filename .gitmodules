@@ -1,0 +1,9 @@
+[submodule "thirdparty/llm-compressor"]
+	path = thirdparty/llm-compressor
+	url = https://github.com/vllm-project/llm-compressor.git
+[submodule "thirdparty/Model-Optimizer"]
+	path = thirdparty/Model-Optimizer
+	url = https://github.com/NVIDIA/Model-Optimizer.git
+[submodule "thirdparty/onnx2torch"]
+	path = thirdparty/onnx2torch
+	url = https://github.com/liwei109/onnx2torch.git

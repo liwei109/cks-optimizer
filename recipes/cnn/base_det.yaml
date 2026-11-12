@@ -1,0 +1,38 @@
+# COCO detection recipe using YOLOv5's raw output and test images for calibration.
+#
+#   cks-opt cnn --config recipes/cnn/base_det.yaml
+#
+# test2017 images are unlabeled but sufficient for calibration; val2017 is held out.
+#
+task: detection
+
+model:
+  name: models/yolov5s.onnx
+  input_shape: [1, 3, 640, 640]
+
+data:
+  root: datasets/coco
+  calibration:
+    split: val2017
+    num_samples: 128
+    batch_size: 32
+  evaluation:
+    split: val2017
+    batch_size: 32
+
+optimize:
+  quantization:
+    mode: int8
+    weights:
+      bits: 8
+      scheme: symmetric
+      granularity: per_channel
+    activations:
+      bits: 8
+      scheme: symmetric
+      granularity: per_tensor
+
+export:
+  output_path: tmp/yolov5s.int8.onnx
+  opset_version: 17
+  output_names: [output0]

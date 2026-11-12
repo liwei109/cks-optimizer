@@ -1,0 +1,38 @@
+# VOC 2012 semantic-segmentation recipe using torchvision DeepLabV3.
+#
+#   cks-opt cnn --config recipes/cnn/base_seg.yaml
+#
+# dataset_root contains VOCdevkit/VOC2012 with train and val segmentation sets.
+#
+task: segmentation
+
+model:
+  name: segmentation.deeplabv3_resnet50
+  pretrained: true
+  input_shape: [1, 3, 520, 520]
+
+data:
+  root: datasets/voc
+  calibration:
+    split: train
+    num_samples: 64
+    batch_size: 1
+  evaluation:
+    split: val
+
+optimize:
+  quantization:
+    mode: int8
+    weights:
+      bits: 8
+      scheme: symmetric
+      granularity: per_channel
+    activations:
+      bits: 8
+      scheme: symmetric
+      granularity: per_tensor
+
+export:
+  output_path: tmp/deeplabv3_voc.int8.onnx
+  opset_version: 17
+  output_names: [out, aux]

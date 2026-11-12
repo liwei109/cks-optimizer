@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch keeps the job small and fast.
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install \
+            -e . \
+            -e thirdparty/Model-Optimizer \
+            -e thirdparty/llm-compressor \
+            -e thirdparty/onnx2torch \
+            pytest
+
+      - name: Tests
+        run: pytest -q tests

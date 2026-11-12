@@ -1,144 +1,59 @@
 # CKS Model Optimizer
 
-A model optimization toolkit for two major scenarios:
+[![CI](https://github.com/liwei109/cks-optimizer/actions/workflows/ci.yml/badge.svg)](https://github.com/liwei109/cks-optimizer/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue)](./LICENSE)
 
-1. CNN / CV models using ModelOpt torch-mode quantization
-2. LLM compression workflows using llmcompressor
+CKS Model Optimizer is a model optimization toolkit with two backends:
 
-This project is intentionally organized as a root-level package without a `src/` wrapper, as requested.
+- **CNN / CV models** — quantization and sparsity via [NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer), exported to ONNX
+- **Large models** — optimization recipes for LLMs, VLMs, and related models via [llm-compressor](https://github.com/vllm-project/llm-compressor), saved in `compressed-tensors` format
 
-## Design overview
+Both backends can be used from the `cks-opt` CLI or Python API.
 
-- `cks_optimizer/cnn/` for traditional vision models such as ResNet, YOLO, UNet, Swin, etc.
-- `cks_optimizer/llm/` for LLM compression using llmcompressor
-- `cks_optimizer/cli.py` for developer-facing CLI entrypoints
+## Installation
 
-## CNN path
-
-The CNN path supports:
-
-- torch model inputs
-- ONNX model inputs
-- ModelOpt-based quantization in torch mode
-- ONNX export of the quantized model
-- dataset adapters for classification, detection, segmentation and custom data
-
-### CNN package structure
-
-```text
-cks_optimizer/
-  cnn/
-    __init__.py
-    api.py
-    config.py
-    modelopt_adapter.py
-    tasks.py
-    pipeline.py
-    data/
-      __init__.py
-      base.py
-      registry.py
-```
-
-### CNN Python example
-
-```python
-import torch
-from cks_optimizer.cnn import CNNConfig, optimize_cnn_model
-
-
-class TinyResNetLike(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.backbone = torch.nn.Sequential(
-            torch.nn.Conv2d(3, 16, 3, padding=1),
-            torch.nn.ReLU(),
-            torch.nn.Conv2d(16, 32, 3, padding=1),
-            torch.nn.ReLU(),
-            torch.nn.AdaptiveAvgPool2d((1, 1)),
-            torch.nn.Flatten(),
-            torch.nn.Linear(32, 10),
-        )
-
-    def forward(self, x):
-        return self.backbone(x)
-
-
-model = TinyResNetLike().eval()
-sample_input = torch.randn(1, 3, 224, 224)
-config = CNNConfig(
-    model_name="resnet",
-    dataset_root="./tmp",
-    quant_mode="int8",
-    output_path="artifacts/resnet_quantized.onnx",
-    use_dynamic_axes=False,
-)
-
-result = optimize_cnn_model(model, sample_input, config=config)
-print(f"Saved quantized ONNX to: {result}")
-```
-
-### CNN CLI example
+Clone the repository with its submodules, then install the project and backends from the repository root:
 
 ```bash
-python -m cks_optimizer cnn \
-  --model mobilenetv2_100 \
-  --dataset ./tmp \
-  --quant-mode int8
+git clone --recurse-submodules https://github.com/liwei109/cks-optimizer.git
+cd cks-optimizer
+python -m pip install -e . \
+  -e thirdparty/Model-Optimizer \
+  -e thirdparty/llm-compressor \
+  -e thirdparty/onnx2torch
 ```
 
-The CLI automatically infers the dataset kind and task from the model/data context and writes the result to `tmp/mobilenetv2_100.int8.onnx` by default. If the inferred dataset kind is wrong (e.g. a COCO image directory without annotation files), override it with `--dataset-kind coco`. You can still override the output path with `--output`, but it is not required.
+Use Python 3.11 or newer.
 
-During quantization the model is calibrated on real images from the dataset directory (up to `CNNConfig.calibration_samples` images, in batches of `calibration_batch_size`); if the directory contains no usable images, the CLI warns and falls back to a single random-sample calibration.
+## Guide
 
-## LLM path
-
-The LLM path uses `llmcompressor` as the backend. It validates model identifiers and calls the compression workflow with calibration dataset arguments.
-
-### LLM Python example
-
-```python
-from cks_optimizer.llm.llmcompressor_adapter import LLMCompressorAdapter
-
-adapter = LLMCompressorAdapter()
-result = adapter.compress(
-    model="Qwen/Qwen2.5-0.5B-Instruct",
-    output_dir="artifacts/llm_example",
-    recipe="quant_8bit",
-    dataset="wikitext",
-    dataset_config_name="wikitext-2-raw-v1",
-    splits="train[:1]",
-    num_calibration_samples=1,
-    max_seq_length=32,
-    trust_remote_code_model=True,
-)
-print(result)
-```
-
-### LLM CLI example
+Run quantization with CLI options:
 
 ```bash
-python -m cks_optimizer llm \
-  --model Qwen/Qwen2.5-0.5B-Instruct \
-  --dataset wikitext \
-  --dataset-config-name wikitext-2-raw-v1 \
-  --splits train[:1] \
-  --num-calibration-samples 1 \
-  --max-seq-length 32 \
-  --output-dir artifacts/llm_example
+cks-opt cnn --model resnet50 --dataset datasets/imagenet --quant-mode int8 --pretrained
 ```
 
-## Dataset support
+Without `--quant-mode`, `--sparsity`, or an optimization section in `--config`,
+the CNN command evaluates the input model without quantizing or sparsifying it.
 
-The CNN pipeline includes dataset adapters for the following categories:
+Or run a recipe from [`recipes/cnn/base_cls.yaml`](recipes/cnn/base_cls.yaml):
 
-- `imagefolder` for ImageFolder-style classification datasets
-- `coco` for COCO detection / segmentation annotations
-- `voc` for Pascal VOC-style annotations
-- `custom` for manifest-based or CSV-based custom datasets
+```bash
+cks-opt cnn --config recipes/cnn/base_cls.yaml
+```
 
-## Notes
+Run large-model optimization with CLI options, using the
+recipe from [`recipes/lm/base_int8.yaml`](recipes/lm/base_int8.yaml):
 
-- CNN optimization is the core path and produces quantized ONNX artifacts.
-- LLM compression is implemented through a thin adapter around llmcompressor.
-- The project intentionally keeps the package at the repository root without a nested `src/` folder.
+```bash
+cks-opt lm --model Qwen/Qwen2.5-0.5B-Instruct \
+  --recipe recipes/lm/base_int8.yaml \
+  --dataset wikitext --dataset-config-name wikitext-2-raw-v1 \
+  --splits "train[:1]" --num-calibration-samples 1 --max-seq-length 32 \
+  --output-dir tmp/qwen2.5-0.5b-instruct.int8
+```
+
+### License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
