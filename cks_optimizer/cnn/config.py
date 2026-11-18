@@ -13,6 +13,14 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Importing the built-in handler implementations registers the supported
+# datasets; the handler registry below then powers task and dataset inference.
+from cks_optimizer.cnn.datasets import registry as _builtin_dataset_handlers  # noqa: E402, F401
+from cks_optimizer.cnn.datasets.handler import (  # noqa: E402
+    DATASET_HANDLER_REGISTRY,
+    iter_dataset_handlers,
+)
+
 __all__ = [
     "QUANT_MODES",
     "SPARSITY_MODES",
@@ -29,11 +37,11 @@ __all__ = [
     "infer_task_from_model_and_dataset",
 ]
 
-# Dataset names and their corresponding vision tasks.
+# Dataset names and their corresponding vision tasks, derived from the
+# registered dataset handlers (see ``cks_optimizer.cnn.datasets.handler``).
 _DATASET_TASKS = {
-    "imagenet": "classification",
-    "coco": "detection",
-    "voc": "segmentation",
+    handler.name: handler.task
+    for handler in DATASET_HANDLER_REGISTRY.values()
 }
 
 # Model-name fragments that imply a specific task.
@@ -163,48 +171,18 @@ def _normalize_grouped_config(data: dict[str, Any]) -> dict[str, Any]:
 def infer_dataset_from_root(dataset_root: str | Path | None) -> str:
     """Infer the dataset from the layout of ``dataset_root``.
 
-    The heuristics are ordered by specificity:
-
-    1. VOC segmentation directories -> ``voc``.
-    2. COCO instance annotations in common annotation directories -> ``coco``.
-    3. Otherwise -> ``imagenet``.
-
-    Only the root, its immediate children, and immediate ``annotations``
-    directories are inspected, avoiding a recursive walk over image datasets.
+    Each registered dataset handler is asked, in order of layout specificity
+    (most specific first), whether the root matches its layout; ImageNet is
+    the fallback. Only the root, its immediate children, and immediate
+    ``annotations`` directories are inspected, avoiding a recursive walk over
+    image datasets.
     """
     root = Path(dataset_root) if dataset_root else Path(".")
     if not root.is_dir():
         return "imagenet"
-
-    search_dirs = [root]
-    search_dirs.extend(
-        candidate
-        for candidate in (root / "VOCdevkit" / "VOC2012", root / "VOC2012")
-        if candidate.is_dir()
-    )
-    child_dirs = sorted(path for path in root.iterdir() if path.is_dir())
-    search_dirs.extend(child_dirs)
-    search_dirs.extend(
-        annotations for child in child_dirs if (annotations := child / "annotations").is_dir()
-    )
-
-    if any(
-        (directory / "JPEGImages").is_dir() and (directory / "SegmentationClass").is_dir()
-        for directory in search_dirs
-    ):
-        return "voc"
-
-    annotation_dirs = [
-        directory
-        for directory in search_dirs
-        if directory == root or directory.name.lower() == "annotations"
-    ]
-    if any(
-        any("instances" in path.name.lower() for path in directory.glob("*.json"))
-        for directory in annotation_dirs
-    ):
-        return "coco"
-
+    for handler in iter_dataset_handlers():
+        if handler.matches_layout(root):
+            return handler.name
     return "imagenet"
 
 

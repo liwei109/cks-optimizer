@@ -1,4 +1,10 @@
-"""Torchvision dataset construction for the supported vision tasks."""
+"""Built-in dataset handlers (ImageNet, COCO, VOC) and compatibility APIs.
+
+Add a new dataset by subclassing :class:`~cks_optimizer.cnn.datasets.handler.
+DatasetHandler` and decorating it with
+:func:`~cks_optimizer.cnn.datasets.handler.register` — see the handlers below
+for reference implementations.
+"""
 
 from __future__ import annotations
 
@@ -10,32 +16,25 @@ from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
 
-__all__ = ["DATASET_REGISTRY", "get_dataset", "normalize_dataset"]
+from cks_optimizer.cnn.datasets.handler import (
+    DATASET_HANDLER_REGISTRY,
+    DatasetHandler,
+    get_handler,
+    image_transform,
+    layout_search_dirs,
+    mask_transform,
+    normalize_dataset,
+    register,
+)
 
-DATASET_REGISTRY = {
-    "imagenet": "torchvision.datasets.ImageFolder",
-    "coco": "torchvision.datasets.CocoDetection",
-    "voc": "torchvision.datasets.VOCSegmentation",
-}
-
-_DATASET_ALIASES = {
-    "imagenet1k": "imagenet",
-    "coco2017": "coco",
-    "coco2014": "coco",
-    "voc2012": "voc",
-    "voc2007": "voc",
-}
-
-
-def normalize_dataset(dataset: str | None) -> str:
-    """Return one of the canonical dataset names."""
-    key = (dataset or "").strip().lower()
-    key = _DATASET_ALIASES.get(key, key)
-    if key not in DATASET_REGISTRY:
-        raise ValueError(
-            f"Unsupported dataset: {dataset!r}. Supported datasets: {sorted(DATASET_REGISTRY)}."
-        )
-    return key
+__all__ = [
+    "DATASET_REGISTRY",
+    "ImageNetHandler",
+    "CocoHandler",
+    "VocHandler",
+    "get_dataset",
+    "normalize_dataset",
+]
 
 
 def _imagenet_root(root: Path, split: str) -> Path:
@@ -166,6 +165,191 @@ def _voc_root(root: Path) -> Path:
     return root
 
 
+def _yolov5_letterbox_transform(shape: tuple[int, ...]) -> Callable[[Image.Image], Tensor]:
+    """Resize with aspect ratio preserved and YOLOv5's 114-valued padding."""
+    from torchvision.transforms import functional as TF
+
+    height, width = shape[2:]
+
+    def transform(image: Image.Image) -> Tensor:
+        image = image.convert("RGB")
+        ratio = min(width / image.width, height / image.height)
+        resized_size = (round(image.width * ratio), round(image.height * ratio))
+        resized = image.resize(resized_size, Image.Resampling.BILINEAR)
+        horizontal_padding = (width - resized.width) / 2
+        vertical_padding = (height - resized.height) / 2
+        left = round(horizontal_padding - 0.1)
+        top = round(vertical_padding - 0.1)
+        canvas = Image.new("RGB", (width, height), color=(114, 114, 114))
+        canvas.paste(resized, (left, top))
+        return TF.to_tensor(canvas)
+
+    return transform
+
+
+@register
+class ImageNetHandler(DatasetHandler):
+    """ImageNet-style classification folders (``train/<class>/*.jpg``)."""
+
+    name = "imagenet"
+    task = "classification"
+    aliases = ("imagenet1k",)
+    torchvision_dataset = "torchvision.datasets.ImageFolder"
+
+    def matches_layout(self, root: Path) -> bool:
+        return True  # Fallback dataset: any layout is potentially ImageNet.
+
+    def build(
+        self,
+        root: Path,
+        split: str,
+        *,
+        image_transform: Callable[[Image.Image], Tensor],
+        target_transform: Any = None,
+    ) -> Dataset[Any]:
+        from torchvision.datasets import ImageFolder
+
+        split_root = _imagenet_root(root, split)
+        if split.lower() in {"val", "validation"}:
+            validation = _official_imagenet_validation(root, split_root, image_transform)
+            if validation is not None:
+                return validation
+        return ImageFolder(split_root, transform=image_transform)
+
+    def make_transforms(
+        self,
+        shape: tuple[int, ...],
+        mean: tuple[float, ...],
+        std: tuple[float, ...],
+    ) -> tuple[Callable[[Image.Image], Tensor], Any]:
+        return image_transform(shape, mean, std), None
+
+    def model_image_transform(
+        self, model: Any, shape: tuple[int, ...]
+    ) -> Callable[[Image.Image], Tensor] | None:
+        if model is None:
+            return None
+        return getattr(model, "_cks_image_transform", None)
+
+    def validate_splits(self, training: Any, evaluation: Any) -> None:
+        if getattr(evaluation, "class_to_idx", {}) != getattr(
+            training, "class_to_idx", {}
+        ):
+            raise ValueError(
+                "ImageNet training and evaluation splits must use the same class directories."
+            )
+
+    def extract_metadata(self, training: Any) -> dict[str, Any]:
+        return dict(getattr(training, "class_to_idx", {}))
+
+
+@register
+class CocoHandler(DatasetHandler):
+    """COCO instance detection with ``instances_<split>.json`` annotations."""
+
+    name = "coco"
+    task = "detection"
+    aliases = ("coco2017", "coco2014")
+    torchvision_dataset = "torchvision.datasets.CocoDetection"
+    layout_priority = 10
+
+    def matches_layout(self, root: Path) -> bool:
+        annotation_dirs = [
+            directory
+            for directory in layout_search_dirs(root)
+            if directory == root or directory.name.lower() == "annotations"
+        ]
+        return any(
+            any("instances" in path.name.lower() for path in directory.glob("*.json"))
+            for directory in annotation_dirs
+        )
+
+    def build(
+        self,
+        root: Path,
+        split: str,
+        *,
+        image_transform: Callable[[Image.Image], Tensor],
+        target_transform: Any = None,
+    ) -> Dataset[Any]:
+        from torchvision.datasets import CocoDetection
+
+        image_dir, annotation_file = _coco_paths(root, split)
+        return CocoDetection(
+            image_dir,
+            annotation_file,
+            transform=image_transform,
+            target_transform=target_transform,
+        )
+
+    def make_transforms(
+        self,
+        shape: tuple[int, ...],
+        mean: tuple[float, ...],
+        std: tuple[float, ...],
+    ) -> tuple[Callable[[Image.Image], Tensor], Any]:
+        return image_transform(shape, mean, std, normalize=False), None
+
+    def model_image_transform(
+        self, model: Any, shape: tuple[int, ...]
+    ) -> Callable[[Image.Image], Tensor] | None:
+        if model is not None and getattr(model, "_cks_yolov5_raw_output", False):
+            return _yolov5_letterbox_transform(shape)
+        return None
+
+
+@register
+class VocHandler(DatasetHandler):
+    """PASCAL VOC 2012 segmentation (``JPEGImages`` + ``SegmentationClass``)."""
+
+    name = "voc"
+    task = "segmentation"
+    aliases = ("voc2012", "voc2007")
+    torchvision_dataset = "torchvision.datasets.VOCSegmentation"
+    layout_priority = 20
+
+    def matches_layout(self, root: Path) -> bool:
+        return any(
+            (directory / "JPEGImages").is_dir()
+            and (directory / "SegmentationClass").is_dir()
+            for directory in layout_search_dirs(root)
+        )
+
+    def build(
+        self,
+        root: Path,
+        split: str,
+        *,
+        image_transform: Callable[[Image.Image], Tensor],
+        target_transform: Any = None,
+    ) -> Dataset[Any]:
+        from torchvision.datasets import VOCSegmentation
+
+        return VOCSegmentation(
+            _voc_root(root),
+            year="2012",
+            image_set=split,
+            transform=image_transform,
+            target_transform=target_transform,
+            download=False,
+        )
+
+    def make_transforms(
+        self,
+        shape: tuple[int, ...],
+        mean: tuple[float, ...],
+        std: tuple[float, ...],
+    ) -> tuple[Callable[[Image.Image], Tensor], Any]:
+        return image_transform(shape, mean, std), mask_transform(shape)
+
+
+# Compatibility constant: canonical dataset name -> backing torchvision class.
+DATASET_REGISTRY = {
+    handler.name: handler.torchvision_dataset
+    for handler in DATASET_HANDLER_REGISTRY.values()
+}
+
+
 def get_dataset(
     dataset: str,
     root: str | Path,
@@ -174,31 +358,10 @@ def get_dataset(
     transform: Any,
     target_transform: Any = None,
 ) -> Dataset[Any]:
-    """Create an ImageNet, COCO, or VOC dataset using torchvision."""
-    from torchvision.datasets import CocoDetection, ImageFolder, VOCSegmentation
-
-    dataset_name = normalize_dataset(dataset)
-    dataset_root = Path(root)
-    if dataset_name == "imagenet":
-        split_root = _imagenet_root(dataset_root, split)
-        if split.lower() in {"val", "validation"}:
-            validation = _official_imagenet_validation(dataset_root, split_root, transform)
-            if validation is not None:
-                return validation
-        return ImageFolder(split_root, transform=transform)
-    if dataset_name == "coco":
-        image_dir, annotation_file = _coco_paths(dataset_root, split)
-        return CocoDetection(
-            image_dir,
-            annotation_file,
-            transform=transform,
-            target_transform=target_transform,
-        )
-    return VOCSegmentation(
-        _voc_root(dataset_root),
-        year="2012",
-        image_set=split,
-        transform=transform,
+    """Create a registered dataset (ImageNet, COCO, or VOC) via its handler."""
+    return get_handler(dataset).build(
+        Path(root),
+        split,
+        image_transform=transform,
         target_transform=target_transform,
-        download=False,
     )
