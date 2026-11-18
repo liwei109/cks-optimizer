@@ -12,7 +12,11 @@ from typing import TYPE_CHECKING, Any
 import torch
 from PIL import Image
 
-from cks_optimizer.cnn.datasets.handler import DatasetHandler, get_handler_for_task
+from cks_optimizer.cnn.datasets.handler import (
+    DatasetHandler,
+    get_handler,
+    get_handler_for_task,
+)
 
 if TYPE_CHECKING:
     from cks_optimizer.cnn.config import OptimizeConfig
@@ -170,7 +174,11 @@ def data_process(
     :func:`~cks_optimizer.cnn.datasets.handler.register`; see
     :mod:`cks_optimizer.cnn.datasets.registry` for the built-in handlers.
     """
-    handler = get_handler_for_task(config.task)
+    handler = (
+        get_handler(config.dataset)
+        if config.dataset
+        else get_handler_for_task(config.task)
+    )
 
     shape = _input_shape(config, model)
     image_transform = (

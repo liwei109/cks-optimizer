@@ -213,3 +213,31 @@ def test_config_sections_select_algorithms_and_calibration():
 def test_config_rejects_enabled_flag():
     with pytest.raises(ValueError, match="include or omit the config section"):
         build_optimize_config({"model_name": "resnet50", "quant": {"enabled": True}})
+
+
+def test_explicit_dataset_pins_task():
+    cfg = build_optimize_config({"model_name": "resnet50"}, dataset="voc")
+
+    assert cfg.dataset == "voc"
+    assert cfg.task == "segmentation"
+
+
+def test_explicit_dataset_normalizes_aliases():
+    cfg = OptimizeConfig(model_name="resnet50", dataset="coco2017")
+
+    assert cfg.dataset == "coco"
+    assert cfg.task == "detection"
+
+
+def test_explicit_dataset_conflicting_task_raises():
+    with pytest.raises(ValueError, match="serves task"):
+        OptimizeConfig(model_name="resnet50", task="detection", dataset="voc")
+
+
+def test_grouped_data_section_accepts_dataset():
+    cfg = build_optimize_config(
+        {"model": {"name": "resnet50"}, "data": {"dataset": "coco"}}
+    )
+
+    assert cfg.dataset == "coco"
+    assert cfg.task == "detection"

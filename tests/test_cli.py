@@ -74,7 +74,7 @@ def test_cli_emits_parseable_json(tmp_path, monkeypatch, capsys):
             "cnn",
             "--model",
             "tiny",
-            "--dataset",
+            "--data-dir",
             str(tmp_path / "images"),
             "--quant-mode",
             "int8",
@@ -169,7 +169,7 @@ def test_cli_evaluation_only_defaults_named_model_to_pretrained(monkeypatch, cap
 
     monkeypatch.setattr(cli, "run_cnn_pipeline", fake_run_cnn_pipeline)
 
-    assert cli.main(["cnn", "--model", "resnet50", "--dataset", "datasets/imagenet"]) == 0
+    assert cli.main(["cnn", "--model", "resnet50", "--data-dir", "datasets/imagenet"]) == 0
 
     assert captured["config"].effective_algorithms == []
     assert captured["config"].pretrained is True
@@ -192,7 +192,7 @@ def test_cli_evaluation_only_respects_no_pretrained(monkeypatch, capsys):
             "cnn",
             "--model",
             "resnet50",
-            "--dataset",
+            "--data-dir",
             "datasets/imagenet",
             "--no-pretrained",
         ]
@@ -200,6 +200,85 @@ def test_cli_evaluation_only_respects_no_pretrained(monkeypatch, capsys):
 
     assert captured["config"].pretrained is False
     capsys.readouterr()
+
+
+@pytest.mark.parametrize(
+    ("data_type", "task"),
+    [
+        ("imagenet", "classification"),
+        ("coco", "detection"),
+        ("voc", "segmentation"),
+    ],
+)
+def test_cli_data_types_selects_preprocessing_task(tmp_path, monkeypatch, data_type, task):
+    from cks_optimizer import cli
+
+    captured = {}
+
+    def fake_run_cnn_pipeline(**kwargs):
+        captured["config"] = kwargs["config"]
+        return _fake_result(kwargs["config"], TinyModel().eval())
+
+    monkeypatch.setattr(cli, "run_cnn_pipeline", fake_run_cnn_pipeline)
+
+    code = cli.main(
+        [
+            "cnn",
+            "--model",
+            "tiny",
+            "--data-dir",
+            str(tmp_path),
+            "--data-types",
+            data_type,
+        ]
+    )
+
+    assert code == 0
+    assert captured["config"].dataset_root == str(tmp_path)
+    assert captured["config"].dataset == data_type
+    assert captured["config"].task == task
+
+
+def test_cli_data_types_overrides_model_name_task_inference(tmp_path, monkeypatch):
+    from cks_optimizer import cli
+
+    captured = {}
+
+    def fake_run_cnn_pipeline(**kwargs):
+        captured["config"] = kwargs["config"]
+        return _fake_result(kwargs["config"], TinyModel().eval())
+
+    monkeypatch.setattr(cli, "run_cnn_pipeline", fake_run_cnn_pipeline)
+
+    assert (
+        cli.main(
+            [
+                "cnn",
+                "--model",
+                "yolov5s",
+                "--data-dir",
+                str(tmp_path),
+                "--data-types",
+                "imagenet",
+            ]
+        )
+        == 0
+    )
+
+    assert captured["config"].dataset == "imagenet"
+    assert captured["config"].task == "classification"
+
+
+def test_cli_cnn_no_longer_accepts_legacy_dataset_flag():
+    with pytest.raises(SystemExit) as excinfo:
+        main(["cnn", "--model", "tiny", "--dataset", "some/dir"])
+    assert excinfo.value.code == 2
+
+
+def test_cli_rejects_unknown_data_type():
+    with pytest.raises(SystemExit) as excinfo:
+        main(["cnn", "--model", "tiny", "--data-types", "ade20k"])
+    assert excinfo.value.code == 2
 
 
 def test_cli_rejects_invalid_lm_model_name():

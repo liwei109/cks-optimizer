@@ -216,3 +216,30 @@ def test_voc_uses_nearest_neighbor_masks(tmp_path):
     assert data.task == "segmentation"
     assert target.shape == (4, 4)
     assert set(target.unique().tolist()) == {0, 1}
+
+
+def test_explicit_dataset_selects_handler_over_model_name_hint(tmp_path):
+    voc_root = tmp_path / "VOCdevkit" / "VOC2012"
+    (voc_root / "JPEGImages").mkdir(parents=True)
+    (voc_root / "SegmentationClass").mkdir()
+    split_dir = voc_root / "ImageSets" / "Segmentation"
+    split_dir.mkdir(parents=True)
+    for split in ("train", "val"):
+        (split_dir / f"{split}.txt").write_text("sample\n")
+    Image.new("RGB", (8, 8), color=(120, 120, 120)).save(voc_root / "JPEGImages" / "sample.jpg")
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[4:, 4:] = 1
+    Image.fromarray(mask).save(voc_root / "SegmentationClass" / "sample.png")
+    config = OptimizeConfig(
+        model_name="resnet50",
+        dataset="voc",
+        dataset_root=str(tmp_path),
+        input_shape=(1, 3, 4, 4),
+    )
+
+    data, _ = data_process(config, include_evaluation=True)
+    _, target = data.evaluation_dataset[0]
+
+    assert data.task == "segmentation"
+    assert target.shape == (4, 4)
+    assert set(target.unique().tolist()) == {0, 1}

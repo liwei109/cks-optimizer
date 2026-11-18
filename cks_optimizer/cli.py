@@ -15,6 +15,7 @@ from cks_optimizer.cnn.config import (
     build_default_output_path,
     build_optimize_config,
 )
+from cks_optimizer.cnn.datasets.handler import DATASET_HANDLER_REGISTRY
 from cks_optimizer.lm.optimizer import LMOptimizer
 
 logger = logging.getLogger(__name__)
@@ -57,9 +58,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Model name or path (overrides the config).",
     )
     cnn_parser.add_argument(
-        "--dataset",
+        "--data-dir",
         default="",
         help="Dataset root directory (overrides the config).",
+    )
+    cnn_parser.add_argument(
+        "--data-types",
+        default="",
+        choices=sorted(DATASET_HANDLER_REGISTRY),
+        help=(
+            "Dataset type used to select the preprocessing pipeline "
+            "(imagenet, coco, voc); overrides automatic task inference."
+        ),
     )
     cnn_parser.add_argument(
         "--quant-mode",
@@ -197,8 +207,12 @@ def _cnn_overrides(args: argparse.Namespace) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
     if args.model:
         overrides["model_name"] = args.model
-    if args.dataset:
-        overrides["dataset_root"] = args.dataset
+    if args.data_dir:
+        overrides["dataset_root"] = args.data_dir
+    if args.data_types:
+        # An explicit dataset type pins the task and the dataset handler
+        # used for preprocessing in ``data_process``.
+        overrides["dataset"] = args.data_types
     if args.quant_mode:
         overrides["quant_mode"] = args.quant_mode
     if args.device:

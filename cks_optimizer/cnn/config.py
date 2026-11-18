@@ -19,6 +19,7 @@ from cks_optimizer.cnn.datasets import registry as _builtin_dataset_handlers  # 
 from cks_optimizer.cnn.datasets.handler import (  # noqa: E402
     DATASET_HANDLER_REGISTRY,
     iter_dataset_handlers,
+    normalize_dataset,
 )
 
 __all__ = [
@@ -128,6 +129,7 @@ def _normalize_grouped_config(data: dict[str, Any]) -> dict[str, Any]:
     unknown_data_keys = set(data_group) - {
         "root",
         "dataset_root",
+        "dataset",
         "calibration",
         "evaluation",
         "evaluation_split",
@@ -137,6 +139,8 @@ def _normalize_grouped_config(data: dict[str, Any]) -> dict[str, Any]:
     for key in ("root", "dataset_root"):
         if key in data_group:
             assign("dataset_root", data_group[key])
+    if "dataset" in data_group:
+        assign("dataset", data_group["dataset"])
     if "calibration" in data_group:
         assign("calibration", data_group["calibration"])
     if "evaluation" in data_group:
@@ -393,6 +397,9 @@ class OptimizeConfig:
     model_name: str = "resnet"
     dataset_root: str = ""
     task: str = ""
+    # Explicit dataset type (e.g. "imagenet", "coco", "voc"); empty means
+    # infer the task from the dataset layout or model name.
+    dataset: str = ""
     input_shape: tuple[int, ...] | None = None
     evaluation_split: str = "val"
     evaluation_batch_size: int = 16
@@ -413,7 +420,19 @@ class OptimizeConfig:
     def __post_init__(self) -> None:
         if self.input_shape is not None:
             self.input_shape = _validate_input_shape(self.input_shape)
-        if not self.task:
+        if self.dataset:
+            # An explicit dataset type pins the task and, downstream in
+            # ``data_process``, the dataset handler used for preprocessing.
+            self.dataset = normalize_dataset(self.dataset)
+            dataset_task = _DATASET_TASKS[self.dataset]
+            if self.task and self.task != dataset_task:
+                raise ValueError(
+                    f"Dataset {self.dataset!r} serves task {dataset_task!r}, "
+                    f"but task is configured as {self.task!r}."
+                )
+            if not self.task:
+                self.task = dataset_task
+        elif not self.task:
             dataset = infer_dataset_from_root(self.dataset_root or ".")
             self.task = infer_task_from_model_and_dataset(self.model_name, dataset)
         self.evaluation_split = str(self.evaluation_split).strip() or "val"
