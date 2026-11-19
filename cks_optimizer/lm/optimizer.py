@@ -44,7 +44,7 @@ class LMOptimizer:
         self.config = config or {}
 
     def is_available(self) -> bool:
-        """Whether ``llmcompressor`` can be imported in this environment."""
+        """Return whether ``llmcompressor`` imports successfully here."""
         try:
             import llmcompressor  # noqa: F401
         except Exception as exc:
@@ -53,7 +53,12 @@ class LMOptimizer:
         return True
 
     def unavailable_reason(self) -> str:
-        """Human-readable reason for :meth:`is_available` returning ``False``."""
+        """Return the import error explaining why the backend is unavailable.
+
+        Returns:
+            An empty string if ``llmcompressor`` is available, otherwise the
+            exception type and message from its failed import.
+        """
         try:
             import llmcompressor  # noqa: F401
         except Exception as exc:
@@ -93,7 +98,31 @@ class LMOptimizer:
         trust_remote_code_model: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Run one-shot large-model optimization if llmcompressor is usable."""
+        """Optimize a large model with the llm-compressor one-shot workflow.
+
+        Args:
+            model: Local model path or Hugging Face model/repository identifier.
+            output_dir: Directory where compressed model artifacts are written.
+            recipe: Optional llm-compressor recipe path or recipe text.
+            dataset: Calibration dataset name or local dataset path.
+            dataset_config_name: Optional dataset configuration.
+            splits: Dataset split selector, such as ``"train[:128]"``.
+            num_calibration_samples: Maximum calibration examples to consume.
+            max_seq_length: Maximum token sequence length.
+            trust_remote_code_model: Whether to allow custom model code from a
+                remote repository.
+            **kwargs: Additional arguments forwarded to llm-compressor's
+                ``Oneshot`` constructor.
+
+        Returns:
+            A result mapping with the model, output directory, dataset, and
+            completion status.
+
+        Raises:
+            ValueError: If ``model`` is not a local path, URL, or repository ID.
+            RuntimeError: If the llm-compressor backend cannot be imported or
+                used in the current environment.
+        """
         self._validate_model_id(model)
 
         if not self.is_available():

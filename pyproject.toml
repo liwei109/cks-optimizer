@@ -21,6 +21,9 @@ dependencies = [
   "Pillow",
   "PyYAML",
   "timm",
+  "torchmetrics",
+  "tqdm",
+  "pycocotools"
 ]
 
 [project.optional-dependencies]

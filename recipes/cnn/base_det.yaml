@@ -1,24 +1,38 @@
-# COCO detection recipe. The ONNX model must return boxes, labels, and scores.
+# COCO detection recipe using YOLOv5's raw output and test images for calibration.
 #
 #   cks-opt cnn --config recipes/cnn/base_det.yaml
 #
-# Supply a detector ONNX model with boxes, labels, and scores outputs.
-# COCO layout follows train2017/ and val2017/ with annotations/ at the root.
-model_name: models/coco_detector.onnx
-dataset_root: datasets/coco
+# test2017 images are unlabeled but sufficient for calibration; val2017 is held out.
+#
 task: detection
-input_shape: [1, 3, 640, 640]
-evaluation_split: val2017
 
-quant:
-  mode: int8
+model:
+  name: models/yolov5s.onnx
+  input_shape: [1, 3, 640, 640]
 
-calibration:
-  num_samples: 64
-  batch_size: 1
-  split: train2017
+data:
+  root: datasets/coco
+  calibration:
+    split: val2017
+    num_samples: 128
+    batch_size: 64
+  evaluation:
+    split: val2017
+    batch_size: 64
+
+optimize:
+  quantization:
+    mode: int8
+    weights:
+      bits: 8
+      scheme: symmetric
+      granularity: per_channel
+    activations:
+      bits: 8
+      scheme: symmetric
+      granularity: per_tensor
 
 export:
-  output_path: tmp/coco_detector.int8.onnx
+  output_path: tmp/yolov5s.int8.onnx
   opset_version: 17
-  output_names: [boxes, labels, scores]
+  output_names: [output0]

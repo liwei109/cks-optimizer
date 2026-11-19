@@ -28,7 +28,19 @@ _DATASET_ALIASES = {
 
 
 def normalize_dataset(dataset: str | None) -> str:
-    """Return one of the canonical dataset names."""
+    """Normalize a supported dataset name or alias.
+
+    Args:
+        dataset: Dataset name or alias, such as ``"ImageNet"``,
+            ``"coco2017"``, or ``"voc2012"``.
+
+    Returns:
+        Canonical lowercase dataset name: ``"imagenet"``, ``"coco"``, or
+        ``"voc"``.
+
+    Raises:
+        ValueError: If the value is not a supported dataset or alias.
+    """
     key = (dataset or "").strip().lower()
     key = _DATASET_ALIASES.get(key, key)
     if key not in DATASET_REGISTRY:
@@ -108,26 +120,46 @@ def _official_imagenet_validation(
 
 
 def _coco_paths(root: Path, split: str) -> tuple[Path, Path]:
-    image_dirs = (
-        root / split / "images",
-        root / split,
-        root / "images" / split,
-        root / "images",
-    )
-    annotation_files = (
-        root / split / "annotations" / f"instances_{split}.json",
-        root / "annotations" / f"instances_{split}.json",
-        root / split / f"instances_{split}.json",
-        root / f"instances_{split}.json",
-    )
-    image_dir = next((path for path in image_dirs if path.is_dir()), None)
-    annotation_file = next((path for path in annotation_files if path.is_file()), None)
-    if image_dir is None or annotation_file is None:
-        raise FileNotFoundError(
-            f"COCO split {split!r} was not found under {root}. Expected an image "
-            "directory and annotations/instances_<split>.json."
+    split_names = [split]
+    normalized_split = split.lower()
+    if normalized_split in {"train", "val", "validation"}:
+        split_names.append(
+            {"train": "train2017", "val": "val2017", "validation": "val2017"}[
+                normalized_split
+            ]
         )
-    return image_dir, annotation_file
+
+    for split_name in dict.fromkeys(split_names):
+        image_dirs = (
+            root / split_name / "images",
+            root / split_name,
+            root / "images" / split_name,
+            root / "images",
+        )
+        annotation_names = [f"instances_{split_name}.json"]
+        if split_name == "test2017":
+            annotation_names.append("image_info_test2017.json")
+        annotation_files = tuple(
+            candidate
+            for name in annotation_names
+            for candidate in (
+                root / split_name / "annotations" / name,
+                root / "annotations" / name,
+                root / split_name / name,
+                root / name,
+            )
+        )
+        image_dir = next((path for path in image_dirs if path.is_dir()), None)
+        annotation_file = next(
+            (path for path in annotation_files if path.is_file()), None
+        )
+        if image_dir is not None and annotation_file is not None:
+            return image_dir, annotation_file
+
+    raise FileNotFoundError(
+        f"COCO split {split!r} was not found under {root}. Expected an image "
+        "directory and annotations/instances_<split>.json."
+    )
 
 
 def _voc_root(root: Path) -> Path:

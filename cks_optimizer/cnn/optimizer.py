@@ -63,6 +63,12 @@ class CNNOptimizer:
     """
 
     def __init__(self, config: Any | None = None):
+        """Create an optimizer from a CNN configuration.
+
+        Args:
+            config: Mapping, file path, ``OptimizeConfig``, legacy
+                ``CNNConfig``, or ``None`` for default settings.
+        """
         self.config = _as_optimize_config(config)
 
     def _validate_backend(self) -> None:

@@ -20,7 +20,18 @@ __all__ = ["OptimizationResult", "run_cnn_pipeline"]
 
 @dataclass
 class OptimizationResult:
-    """Models, data, and artifacts produced by a CNN optimization run."""
+    """Models, data, metrics, and artifacts produced by a CNN run.
+
+    Attributes:
+        config: Normalized configuration used for the run.
+        data: Prepared calibration and held-out evaluation data.
+        model: Loaded input model.
+        sample_input: Representative tensor used for optimization and export.
+        optimized_model: Model after configured optimization algorithms.
+        onnx_path: Path to the exported ONNX model.
+        algorithms: Optimization algorithms that ran, in execution order.
+        evaluation: Evaluation metrics, or ``None`` when evaluation was skipped.
+    """
 
     config: OptimizeConfig
     data: ProcessedData
@@ -32,6 +43,7 @@ class OptimizationResult:
     evaluation: EvaluationResult | None = None
 
     def summary(self) -> str:
+        """Return a concise multiline summary of the optimization result."""
         lines = [
             f"model={self.config.model_name}",
             f"task={self.config.task}",
@@ -50,60 +62,86 @@ def run_cnn_pipeline(
     *,
     model: Any = None,
     evaluate_model: bool = True,
-    providers: list[str] | None = None,
     **overrides: Any,
 ) -> OptimizationResult:
     """Run the CNN optimization pipeline.
 
-    ``model`` accepts a model instance, model name, or model path and
-    overrides ``config.model_name`` when provided. Calibration and export
-    inputs come from the dataset where possible.
+    The model source may be supplied as ``model`` or ``config.model_name``.
+    Calibration and export inputs are prepared from the configured dataset.
     Algorithms are selected by the configured ``quant`` and ``sparsity``
-    sections.
+    sections; sparsification runs before quantization when both are set.
+
+    Args:
+        config: Configuration mapping, file path, or configuration object.
+        model: Optional model source that overrides ``config.model_name``.
+        evaluate_model: Whether to load an evaluation split and compute metrics.
+        **overrides: Configuration values applied on top of ``config``.
+
+    Returns:
+        An :class:`OptimizationResult` containing the optimized model, metrics,
+        and exported ONNX path.
+
+    Raises:
+        ValueError: If configuration is invalid or no work is enabled.
+        RuntimeError: If CUDA is the selected device but is unavailable.
     """
     # Normalize the config and apply explicit overrides.
     cfg = build_optimize_config(config, **overrides)
-    if not cfg.effective_algorithms:
+    if not cfg.effective_algorithms and not evaluate_model:
         raise ValueError(
-            "No optimization algorithm configured. Add a 'quant' and/or "
-            "'sparsity' section to the config."
+            "No quantization or sparsity algorithm is configured, and evaluation "
+            "is disabled. Enable evaluation or configure an optimization algorithm."
         )
 
+    device = torch.device(str(cfg.device).strip() or "cuda")
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is the default device for CNN calibration and evaluation, but it "
+            "is unavailable. Specify device='cpu' or pass --device cpu to use CPU."
+        )
+    cfg.device = str(device)
+
     # Load onnx or pytorch model.
+    model_source = model if model is not None else cfg.model_name
     model = load_cnn_model(
-        model if model is not None else cfg.model_name,
+        model_source,
         pretrained=cfg.pretrained,
-        device=cfg.device or None,
+        device=device,
     )
 
-    # Prepare calibration data and sample input.
+    # Evaluation-only runs need the validation set, but not a calibration split.
     data, sample_input = data_process(
         cfg,
         model=model,
         include_evaluation=evaluate_model and cfg.evaluation_supported,
+        include_calibration=bool(cfg.effective_algorithms),
     )
 
-    # Sparsify and quantize the model.
-    optimized_model = optimize_cnn_model(
-        model,
-        sample_input,
-        config=cfg,
-        calib_data=data.calib_data,
+    # Optimize the model with the configured algorithms.
+    optimized_model = (
+        optimize_cnn_model(
+            model,
+            sample_input,
+            config=cfg,
+            calib_data=data.calib_data,
+        )
+        if cfg.effective_algorithms
+        else model
     )
 
-    # Export the optimized model.
-    optimized_onnx_path = export_onnx(optimized_model, sample_input, config=cfg)
-
-    # Measure metrics and analyze the optimized error.
+    # Evaluate the optimized model on the held-out split.
     evaluation = evaluate(
-        optimized_onnx_path,
+        optimized_model,
         data.evaluation_dataset,
         task=cfg.task,
         config=cfg,
         enabled=evaluate_model,
-        input_name=cfg.export.input_names[0],
-        providers=providers,
+        device=device,
+        batch_size=cfg.evaluation_batch_size,
     )
+
+    # Export the optimized model to ONNX at the configured output path.
+    onnx_path = export_onnx(optimized_model.to("cpu"), sample_input.cpu(), cfg)
 
     return OptimizationResult(
         config=cfg,
@@ -111,7 +149,7 @@ def run_cnn_pipeline(
         model=model,
         sample_input=sample_input,
         optimized_model=optimized_model,
-        onnx_path=optimized_onnx_path,
+        onnx_path=onnx_path,
         evaluation=evaluation,
         algorithms=tuple(cfg.effective_algorithms),
     )

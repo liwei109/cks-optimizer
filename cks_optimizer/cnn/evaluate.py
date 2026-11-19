@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
-import io
 import logging
-from collections.abc import Sequence
-from contextlib import redirect_stdout
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
+from torchmetrics.classification import (
+    MulticlassAccuracy,
+    MulticlassConfusionMatrix,
+    MulticlassJaccardIndex,
+)
+from torchmetrics.detection import MeanAveragePrecision
+from tqdm.auto import tqdm
 
 from cks_optimizer.cnn.config import OptimizeConfig
+from cks_optimizer.cnn.detection import detection_prediction
+from cks_optimizer.cnn.models import CNNModelMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +28,17 @@ __all__ = ["EvaluationResult", "evaluate", "resolve_input_name"]
 
 @dataclass
 class EvaluationResult:
-    """Task metric values measured against dataset annotations."""
+    """Task metric values measured against dataset annotations.
+
+    Attributes:
+        task: Evaluated task name.
+        num_samples: Number of images evaluated.
+        accuracy: Top-1 classification accuracy, or ``None`` for other tasks.
+        mean_average_precision: COCO bbox mAP, or ``None`` for other tasks.
+        map_50: COCO bbox mAP at IoU 0.50.
+        map_75: COCO bbox mAP at IoU 0.75.
+        mean_iou: Mean intersection over union, or ``None`` for other tasks.
+    """
 
     task: str
     num_samples: int
@@ -33,6 +49,7 @@ class EvaluationResult:
     mean_iou: float | None = None
 
     def summary(self) -> str:
+        """Format the result as a concise human-readable metric summary."""
         if self.task == "classification":
             metric = f"accuracy={self.accuracy:.4f}"
         elif self.task == "detection":
@@ -46,11 +63,27 @@ class EvaluationResult:
 
 
 def resolve_input_name(onnx_path: str | Path, *, preferred: str | None = None) -> str:
-    """Return a real input name from an ONNX graph."""
+    """Return a usable input name from an ONNX graph.
+
+    Initializer-backed graph inputs are excluded. If ``preferred`` names a
+    usable input, it is returned; otherwise the graph's first usable input is
+    selected.
+
+    Args:
+        onnx_path: ONNX model file to inspect.
+        preferred: Optional input name to prefer when present.
+
+    Returns:
+        The selected graph input name.
+
+    Raises:
+        FileNotFoundError: If the ONNX file cannot be loaded.
+        ValueError: If the graph has no usable inputs.
+    """
     try:
         import onnx
     except ImportError as exc:  # pragma: no cover
-        raise ImportError("onnx is required for ONNX evaluation.") from exc
+        raise ImportError("onnx is required for ONNX input-name resolution.") from exc
 
     model = onnx.load(str(onnx_path))
     initializers = {initializer.name for initializer in model.graph.initializer}
@@ -62,223 +95,294 @@ def resolve_input_name(onnx_path: str | Path, *, preferred: str | None = None) -
     return names[0]
 
 
-def _create_session(onnx_path: str | Path, providers: Sequence[str] | None) -> Any:
-    try:
-        import onnxruntime as ort
-    except ImportError as exc:  # pragma: no cover
-        raise ImportError("onnxruntime is required for ONNX evaluation.") from exc
-
-    available = ort.get_available_providers()
-    selected = [provider for provider in (providers or available) if provider in available]
-    if not selected:
-        logger.warning("Requested ONNX Runtime providers are unavailable; using CPU.")
-        selected = ["CPUExecutionProvider"]
-    return ort.InferenceSession(str(onnx_path), providers=selected)
-
-
-def _session_input_name(session: Any, requested: str | None) -> str:
-    names = [item.name for item in session.get_inputs()]
-    if not names:
-        raise ValueError("The ONNX model has no inputs.")
-    if requested and requested in names:
-        return requested
-    if requested:
-        logger.warning("ONNX input %r not found; using %r.", requested, names[0])
-    return names[0]
-
-
-def _batch_size(session: Any) -> int:
-    dimension = session.get_inputs()[0].shape[0]
-    return 1 if isinstance(dimension, int) else 16
-
-
-def _batches(dataset: Any, batch_size: int):
+def _batches(dataset: Any, batch_size: int) -> Iterator[tuple[torch.Tensor, list[Any]]]:
     for start in range(0, len(dataset), batch_size):
-        samples = [dataset[index] for index in range(start, min(start + batch_size, len(dataset)))]
-        images = torch.stack([sample[0] for sample in samples])
-        targets = [sample[1] for sample in samples]
-        yield images, targets
-
-
-def _classification_accuracy(session: Any, input_name: str, dataset: Any) -> EvaluationResult:
-    correct = 0
-    for images, targets in _batches(dataset, _batch_size(session)):
-        outputs = session.run(None, {input_name: images.numpy()})
-        logits = np.asarray(outputs[0])
-        if logits.ndim != 2 or logits.shape[0] != len(targets):
-            raise ValueError(
-                f"Classification output must have shape [batch, classes], got {logits.shape}."
-            )
-        correct += sum(
-            int(prediction) == int(target)
-            for prediction, target in zip(logits.argmax(axis=1), targets, strict=True)
+        samples = [
+            dataset[index]
+            for index in range(start, min(start + batch_size, len(dataset)))
+        ]
+        yield (
+            torch.stack([sample[0] for sample in samples]),
+            [sample[1] for sample in samples],
         )
+
+
+def _classification_accuracy(
+    model: torch.nn.Module,
+    dataset: Any,
+    batch_size: int,
+    device: torch.device,
+) -> EvaluationResult:
+    accuracy = None
+    with tqdm(
+        total=len(dataset), desc="Classification evaluation", unit="image"
+    ) as progress:
+        for images, targets in _batches(dataset, batch_size):
+            logits = model(images.to(device))
+            if isinstance(logits, Mapping):
+                logits = logits.get("logits")
+            elif hasattr(logits, "logits"):
+                logits = logits.logits
+            if not isinstance(logits, torch.Tensor) or logits.ndim != 2:
+                raise ValueError(
+                    "Classification output must have shape [batch, classes]."
+                )
+            if logits.shape[0] != len(targets):
+                raise ValueError(
+                    "Classification output batch size does not match targets."
+                )
+            if accuracy is None:
+                accuracy = MulticlassAccuracy(
+                    num_classes=logits.shape[1], average="micro"
+                ).to(device)
+            accuracy.update(
+                logits, torch.as_tensor(targets, device=device, dtype=torch.long)
+            )
+            progress.update(len(targets))
+
+    if accuracy is None:
+        raise ValueError("The classification evaluation split is empty.")
     return EvaluationResult(
         task="classification",
         num_samples=len(dataset),
-        accuracy=correct / len(dataset),
+        accuracy=float(accuracy.compute().item()),
     )
 
 
-def _segmentation_miou(session: Any, input_name: str, dataset: Any) -> EvaluationResult:
-    confusion: torch.Tensor | None = None
-    for images, targets in _batches(dataset, _batch_size(session)):
-        outputs = session.run(None, {input_name: images.numpy()})
-        logits = torch.as_tensor(np.asarray(outputs[0]))
-        if logits.ndim != 4 or logits.shape[0] != len(targets):
-            raise ValueError(
-                f"Segmentation output must have shape [batch, classes, height, width], "
-                f"got {tuple(logits.shape)}."
-            )
-        classes = logits.shape[1]
-        predictions = logits.argmax(dim=1).to(torch.int64)
-        for prediction, target in zip(predictions, targets, strict=True):
-            target = torch.as_tensor(target, dtype=torch.int64)
-            if prediction.shape != target.shape:
-                prediction = torch.nn.functional.interpolate(
-                    prediction[None, None].float(),
-                    size=target.shape,
-                    mode="nearest",
-                )[0, 0].to(torch.int64)
-
-            valid = target != 255
-            if torch.any((target[valid] < 0) | (target[valid] >= classes)):
-                raise ValueError(
-                    f"VOC target contains a class outside the model's {classes} outputs."
+def _segmentation_miou(
+    model: torch.nn.Module,
+    dataset: Any,
+    batch_size: int,
+    device: torch.device,
+) -> EvaluationResult:
+    confusion = jaccard = None
+    with tqdm(
+        total=len(dataset), desc="Segmentation evaluation", unit="image"
+    ) as progress:
+        for images, targets in _batches(dataset, batch_size):
+            outputs = model(images.to(device))
+            if isinstance(outputs, Mapping):
+                outputs = outputs.get("out")
+            if not isinstance(outputs, torch.Tensor) or outputs.ndim != 4:
+                shape = (
+                    tuple(outputs.shape)
+                    if isinstance(outputs, torch.Tensor)
+                    else type(outputs)
                 )
-            encoded = target[valid] * classes + prediction[valid]
-            counts = torch.bincount(encoded, minlength=classes * classes).reshape(classes, classes)
-            confusion = counts if confusion is None else confusion + counts
+                raise ValueError(
+                    "Segmentation output must have shape [batch, classes, height, width], "
+                    f"got {shape}."
+                )
+            if outputs.shape[0] != len(targets):
+                raise ValueError(
+                    f"Segmentation output batch size {outputs.shape[0]} does not "
+                    f"match target batch size {len(targets)}."
+                )
+            predictions = outputs.argmax(dim=1)
+            target_batch = torch.stack(
+                [torch.as_tensor(target, dtype=torch.long) for target in targets]
+            ).to(device)
+            if predictions.shape[-2:] != target_batch.shape[-2:]:
+                predictions = torch.nn.functional.interpolate(
+                    predictions[:, None].float(),
+                    size=target_batch.shape[-2:],
+                    mode="nearest",
+                )[:, 0].long()
 
-    if confusion is None:
-        raise ValueError("The VOC evaluation split is empty.")
-    true_positive = confusion.diag()
-    union = confusion.sum(dim=0) + confusion.sum(dim=1) - true_positive
-    present = union > 0
+            classes = outputs.shape[1]
+            valid = target_batch != 255
+            if torch.any((target_batch[valid] < 0) | (target_batch[valid] >= classes)):
+                raise ValueError(
+                    f"Segmentation target contains a class outside the model's {classes} outputs."
+                )
+            if confusion is None:
+                confusion = MulticlassConfusionMatrix(
+                    num_classes=classes, ignore_index=255
+                ).to(device)
+                jaccard = MulticlassJaccardIndex(
+                    num_classes=classes,
+                    average="none",
+                    ignore_index=255,
+                    zero_division=0,
+                ).to(device)
+            confusion.update(predictions, target_batch)
+            jaccard.update(predictions, target_batch)
+            progress.update(len(targets))
+
+    if confusion is None or jaccard is None:
+        raise ValueError("The segmentation evaluation split is empty.")
+    matrix = confusion.compute()
+    present = (matrix.sum(dim=0) + matrix.sum(dim=1)) > 0
     if not present.any():
-        raise ValueError("The VOC evaluation split contains no labeled pixels.")
-    mean_iou = float((true_positive[present] / union[present]).mean())
-    return EvaluationResult(task="segmentation", num_samples=len(dataset), mean_iou=mean_iou)
+        raise ValueError(
+            "The segmentation evaluation split contains no labeled pixels."
+        )
+    per_class_iou = jaccard.compute()
+    return EvaluationResult(
+        task="segmentation",
+        num_samples=len(dataset),
+        mean_iou=float(per_class_iou[present].mean().item()),
+    )
 
 
-def _named_outputs(session: Any, outputs: Sequence[np.ndarray]) -> dict[str, np.ndarray]:
-    metadata = session.get_outputs()
-    if len(metadata) != len(outputs):
-        raise ValueError("ONNX output metadata does not match model output count.")
-    return {metadata[index].name.lower(): np.asarray(value) for index, value in enumerate(outputs)}
-
-
-def _detection_outputs(named: dict[str, np.ndarray]) -> tuple[np.ndarray, ...]:
-    aliases = {
-        "boxes": ("boxes", "detection_boxes"),
-        "labels": ("labels", "detection_classes", "classes"),
-        "scores": ("scores", "detection_scores"),
-    }
-    values = {
-        key: next((named[name] for name in names if name in named), None)
-        for key, names in aliases.items()
-    }
-    if any(value is None for value in values.values()):
-        raise ValueError("COCO mAP requires ONNX outputs named boxes, labels, and scores.")
-    boxes = np.asarray(values["boxes"]).reshape(-1, 4)
-    labels = np.asarray(values["labels"]).reshape(-1)
-    scores = np.asarray(values["scores"]).reshape(-1)
-    if len(boxes) != len(labels) or len(labels) != len(scores):
-        raise ValueError("Detection boxes, labels, and scores must have equal lengths.")
-    return boxes, labels, scores
-
-
-def _coco_map(session: Any, input_name: str, dataset: Any) -> EvaluationResult:
+def _coco_map(
+    model: torch.nn.Module,
+    dataset: Any,
+    batch_size: int,
+    device: torch.device,
+) -> EvaluationResult:
+    if not hasattr(dataset, "coco") or not hasattr(dataset, "ids"):
+        raise ValueError(
+            "Detection evaluation requires a COCO dataset with annotations."
+        )
     try:
-        from pycocotools.coco import COCO
-        from pycocotools.cocoeval import COCOeval
-    except ImportError as exc:  # pragma: no cover
+        metric = MeanAveragePrecision(box_format="xyxy", iou_type="bbox").to(device)
+    except (
+        ImportError,
+        ModuleNotFoundError,
+    ) as exc:  # pragma: no cover - optional COCO backend
         raise ImportError(
-            "COCO mAP requires pycocotools. Install it with `pip install cks-optimizer[coco]`."
+            "COCO mAP requires pycocotools. Install it with "
+            "`pip install cks-optimizer[coco]`."
         ) from exc
 
-    predictions: list[dict[str, Any]] = []
     image_ids = [int(image_id) for image_id in dataset.ids]
-    for index, image_id in enumerate(image_ids):
-        image, _ = dataset[index]
-        outputs = session.run(None, {input_name: image.unsqueeze(0).numpy()})
-        boxes, labels, scores = _detection_outputs(_named_outputs(session, outputs))
-        original = dataset.coco.imgs[image_id]
-        width_scale = original["width"] / image.shape[-1]
-        height_scale = original["height"] / image.shape[-2]
-        for box, label, score in zip(boxes, labels, scores, strict=True):
-            x1, y1, x2, y2 = (float(value) for value in box)
-            predictions.append(
-                {
-                    "image_id": image_id,
-                    "category_id": int(label),
-                    "bbox": [
-                        x1 * width_scale,
-                        y1 * height_scale,
-                        (x2 - x1) * width_scale,
-                        (y2 - y1) * height_scale,
-                    ],
-                    "score": float(score),
-                }
+    valid_category_ids = {int(category_id) for category_id in dataset.coco.getCatIds()}
+    with tqdm(
+        total=len(image_ids), desc="Detection evaluation", unit="image"
+    ) as progress:
+        for start in range(0, len(image_ids), batch_size):
+            batch_ids = image_ids[start : start + batch_size]
+            samples = [
+                dataset[index]
+                for index in range(start, min(start + batch_size, len(image_ids)))
+            ]
+            images = torch.stack([sample[0] for sample in samples]).to(device)
+            torchvision_model = all(
+                hasattr(model, name) for name in ("transform", "rpn", "roi_heads")
             )
+            outputs = model(list(images)) if torchvision_model else model(images)
+            predictions, targets = [], []
+            for index, (image_id, (_, annotations)) in enumerate(
+                zip(batch_ids, samples, strict=True)
+            ):
+                original = dataset.coco.imgs[image_id]
+                predictions.append(
+                    detection_prediction(
+                        outputs,
+                        index,
+                        len(samples),
+                        valid_category_ids,
+                        (images.shape[-2], images.shape[-1]),
+                        (original["height"], original["width"]),
+                        device,
+                    )
+                )
+                boxes, labels = [], []
+                for annotation in annotations or []:
+                    x, y, width, height = annotation["bbox"]
+                    boxes.append((x, y, x + width, y + height))
+                    labels.append(annotation["category_id"])
+                targets.append(
+                    {
+                        "boxes": torch.tensor(
+                            boxes, dtype=torch.float32, device=device
+                        ).reshape(-1, 4),
+                        "labels": torch.tensor(labels, dtype=torch.long, device=device),
+                    }
+                )
+            metric.update(predictions, targets)
+            progress.update(len(samples))
 
-    coco_ground_truth = dataset.coco
-    if predictions:
-        coco_predictions = coco_ground_truth.loadRes(predictions)
-    else:
-        coco_predictions = COCO()
-        coco_predictions.dataset = {
-            "images": coco_ground_truth.dataset["images"],
-            "categories": coco_ground_truth.dataset["categories"],
-            "annotations": [],
-        }
-        coco_predictions.createIndex()
-    evaluator = COCOeval(coco_ground_truth, coco_predictions, "bbox")
-    evaluator.params.imgIds = image_ids
-    with redirect_stdout(io.StringIO()):
-        evaluator.evaluate()
-        evaluator.accumulate()
-        evaluator.summarize()
+    values = metric.compute()
     return EvaluationResult(
         task="detection",
         num_samples=len(image_ids),
-        mean_average_precision=float(evaluator.stats[0]),
-        map_50=float(evaluator.stats[1]),
-        map_75=float(evaluator.stats[2]),
+        mean_average_precision=float(values["map"].item()),
+        map_50=float(values["map_50"].item()),
+        map_75=float(values["map_75"].item()),
     )
 
 
 def evaluate(
-    onnx_path: str | Path,
+    model: torch.nn.Module,
     dataset: Any,
     *,
     task: str | None = None,
     config: OptimizeConfig | None = None,
     enabled: bool = True,
-    input_name: str | None = None,
-    providers: Sequence[str] | None = None,
+    device: str | torch.device | None = None,
+    batch_size: int | None = None,
 ) -> EvaluationResult | None:
-    """Evaluate an ONNX model against ImageNet, COCO, or VOC annotations."""
+    """Evaluate a model against a held-out classification, detection, or segmentation set.
+
+    Classification reports top-1 accuracy, detection reports COCO bounding-box
+    mAP, and segmentation reports mean IoU. Evaluation preserves the model's
+    original training/evaluation state.
+
+    Args:
+        model: PyTorch model to evaluate.
+        dataset: Non-empty held-out dataset returning image/target pairs.
+        task: Task name; defaults to ``config.task`` when config is provided.
+        config: Optional configuration for task support and evaluation batch size.
+        enabled: If false, skip evaluation and return ``None``.
+        device: Device for model execution and metric accumulation. If omitted,
+            use the model's current device.
+        batch_size: Evaluation batch size. Defaults to the config value or 16.
+
+    Returns:
+        An :class:`EvaluationResult`, or ``None`` if evaluation is disabled or
+        unsupported by the configured quantization mode.
+
+    Raises:
+        TypeError: If ``model`` is not a PyTorch module.
+        ValueError: If the task is unsupported, the dataset is empty, or model
+            outputs do not match the requested task.
+        ImportError: If COCO mAP is requested but ``pycocotools`` is unavailable.
+    """
     if not enabled:
         return None
     if config is not None and not config.evaluation_supported:
         quant_mode = config.quant.mode if config.quant is not None else "unknown"
         logger.info(
-            "Skipping evaluation: quantization mode %r emits operators that "
-            "ONNX Runtime cannot execute.",
+            "Skipping evaluation: quantization mode %r is not supported by this "
+            "evaluation pipeline.",
             quant_mode,
         )
         return None
     task = task or (config.task if config is not None else None)
     if task not in {"classification", "detection", "segmentation"}:
         raise ValueError(f"Unsupported evaluation task: {task!r}.")
+    if not isinstance(model, torch.nn.Module):
+        raise TypeError("Evaluation requires a torch.nn.Module.")
     if dataset is None or len(dataset) == 0:
         raise ValueError("A non-empty held-out dataset is required for evaluation.")
 
-    session = _create_session(onnx_path, providers)
-    input_name = _session_input_name(session, input_name)
-    if task == "classification":
-        return _classification_accuracy(session, input_name, dataset)
-    if task == "detection":
-        return _coco_map(session, input_name, dataset)
-    return _segmentation_miou(session, input_name, dataset)
+    if device is not None and str(device).strip():
+        device = torch.device(device)
+    else:
+        parameter = next(model.parameters(), None)
+        buffer = next(model.buffers(), None)
+        device = (
+            parameter.device
+            if parameter is not None
+            else (buffer.device if buffer is not None else torch.device("cpu"))
+        )
+    if batch_size is None:
+        batch_size = config.evaluation_batch_size if config else 16
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}.")
+    input_shape = CNNModelMetadata.for_model(model).input_shape
+    if input_shape and isinstance(input_shape[0], int):
+        batch_size = min(batch_size, input_shape[0])
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.inference_mode():
+            if task == "classification":
+                return _classification_accuracy(model, dataset, batch_size, device)
+            if task == "detection":
+                return _coco_map(model, dataset, batch_size, device)
+            return _segmentation_miou(model, dataset, batch_size, device)
+    finally:
+        model.train(was_training)

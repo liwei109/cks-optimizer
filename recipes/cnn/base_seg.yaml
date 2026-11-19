@@ -3,20 +3,34 @@
 #   cks-opt cnn --config recipes/cnn/base_seg.yaml
 #
 # dataset_root contains VOCdevkit/VOC2012 with train and val segmentation sets.
-model_name: segmentation.deeplabv3_resnet50
-pretrained: true
-dataset_root: datasets/voc
+#
 task: segmentation
-input_shape: [1, 3, 520, 520]
-evaluation_split: val
 
-quant:
-  mode: int8
+model:
+  name: segmentation.deeplabv3_resnet50
+  pretrained: true
+  input_shape: [1, 3, 520, 520]
 
-calibration:
-  num_samples: 64
-  batch_size: 1
-  split: train
+data:
+  root: datasets/voc
+  calibration:
+    split: train
+    num_samples: 64
+    batch_size: 1
+  evaluation:
+    split: val
+
+optimize:
+  quantization:
+    mode: int8
+    weights:
+      bits: 8
+      scheme: symmetric
+      granularity: per_channel
+    activations:
+      bits: 8
+      scheme: symmetric
+      granularity: per_tensor
 
 export:
   output_path: tmp/deeplabv3_voc.int8.onnx
