@@ -17,9 +17,7 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 from cks_optimizer.cnn.datasets.handler import (
-    DATASET_HANDLER_REGISTRY,
     DatasetHandler,
-    get_handler,
     image_transform,
     layout_search_dirs,
     mask_transform,
@@ -28,11 +26,9 @@ from cks_optimizer.cnn.datasets.handler import (
 )
 
 __all__ = [
-    "DATASET_REGISTRY",
     "ImageNetHandler",
     "CocoHandler",
     "VocHandler",
-    "get_dataset",
     "normalize_dataset",
 ]
 
@@ -194,7 +190,6 @@ class ImageNetHandler(DatasetHandler):
     name = "imagenet"
     task = "classification"
     aliases = ("imagenet1k",)
-    torchvision_dataset = "torchvision.datasets.ImageFolder"
 
     def matches_layout(self, root: Path) -> bool:
         return True  # Fallback dataset: any layout is potentially ImageNet.
@@ -250,7 +245,6 @@ class CocoHandler(DatasetHandler):
     name = "coco"
     task = "detection"
     aliases = ("coco2017", "coco2014")
-    torchvision_dataset = "torchvision.datasets.CocoDetection"
     layout_priority = 10
 
     def matches_layout(self, root: Path) -> bool:
@@ -305,7 +299,6 @@ class VocHandler(DatasetHandler):
     name = "voc"
     task = "segmentation"
     aliases = ("voc2012", "voc2007")
-    torchvision_dataset = "torchvision.datasets.VOCSegmentation"
     layout_priority = 20
 
     def matches_layout(self, root: Path) -> bool:
@@ -341,27 +334,3 @@ class VocHandler(DatasetHandler):
         std: tuple[float, ...],
     ) -> tuple[Callable[[Image.Image], Tensor], Any]:
         return image_transform(shape, mean, std), mask_transform(shape)
-
-
-# Compatibility constant: canonical dataset name -> backing torchvision class.
-DATASET_REGISTRY = {
-    handler.name: handler.torchvision_dataset
-    for handler in DATASET_HANDLER_REGISTRY.values()
-}
-
-
-def get_dataset(
-    dataset: str,
-    root: str | Path,
-    split: str,
-    *,
-    transform: Any,
-    target_transform: Any = None,
-) -> Dataset[Any]:
-    """Create a registered dataset (ImageNet, COCO, or VOC) via its handler."""
-    return get_handler(dataset).build(
-        Path(root),
-        split,
-        image_transform=transform,
-        target_transform=target_transform,
-    )

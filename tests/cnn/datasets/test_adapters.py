@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 
 from cks_optimizer.cnn.datasets.registry import (
-    DATASET_REGISTRY,
     _coco_paths,
     normalize_dataset,
 )
@@ -28,10 +27,6 @@ def test_normalize_dataset(kind, expected):
 def test_normalize_dataset_rejects_unsupported_datasets(kind):
     with pytest.raises(ValueError, match="Supported datasets"):
         normalize_dataset(kind)
-
-
-def test_registry_contains_only_task_datasets():
-    assert set(DATASET_REGISTRY) == {"imagenet", "coco", "voc"}
 
 
 def test_coco_paths_resolve_2017_splits_from_short_names(tmp_path):

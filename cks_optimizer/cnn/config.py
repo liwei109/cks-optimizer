@@ -487,20 +487,9 @@ class OptimizeConfig:
         return algorithms
 
     @property
-    def requires_calibration(self) -> bool:
-        """Whether a configured algorithm needs calibration data."""
-        if self.quant is not None:
-            return True
-        return self.sparsity is not None and self.sparsity.mode == "sparsegpt"
-
-    @property
     def evaluation_supported(self) -> bool:
         """Whether ONNX Runtime supports the configured quantization mode."""
         return self.quant is None or self.quant.mode not in TRT_ONLY_QUANT_MODES
-
-    def output_file(self) -> Path:
-        """Return the ONNX output path as a :class:`~pathlib.Path`."""
-        return Path(self.export.output_path)
 
 
 # Config loading

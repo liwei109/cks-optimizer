@@ -197,17 +197,14 @@ def test_config_sections_select_algorithms_and_calibration():
         sparsity=SparsityConfig(mode="sparse_magnitude"),
     )
     assert cfg.effective_algorithms == ["sparsify", "quantize"]
-    assert cfg.requires_calibration is True
 
     sparse_only = OptimizeConfig(
         model_name="resnet50", sparsity=SparsityConfig(mode="sparsegpt")
     )
     assert sparse_only.effective_algorithms == ["sparsify"]
-    assert sparse_only.requires_calibration is True
 
     plain = OptimizeConfig(model_name="resnet50")
     assert plain.effective_algorithms == []
-    assert plain.requires_calibration is False
 
 
 def test_config_rejects_enabled_flag():

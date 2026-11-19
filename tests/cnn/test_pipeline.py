@@ -732,7 +732,7 @@ def test_config_and_output_file_are_consistent(tmp_path):
         dataset_root=str(tmp_path),
         export=ExportConfig(output_path=str(tmp_path / "custom.onnx")),
     )
-    assert config.output_file().name == "custom.onnx"
+    assert config.export.output_path.endswith("custom.onnx")
     assert config.task == "classification"
 
 
